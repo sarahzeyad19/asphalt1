@@ -170,8 +170,8 @@ TARGET = "Rut_20k"
 ID_COL = "MixDesignKey"
 
 # ---- DATA SPLIT (only thing that differs between the two delivered scripts) ----
-TRAIN_SIZE = 0.70
-VALIDATION_SIZE = 0.10
+TRAIN_SIZE = 0.65
+VALIDATION_SIZE = 0.15
 TEST_SIZE = 0.20
 # Development data = train + validation. Locked test is held out.
 SPLIT_TAG = f"{int(TRAIN_SIZE*100)}_{int(VALIDATION_SIZE*100)}_{int(TEST_SIZE*100)}"
