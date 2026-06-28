@@ -173,7 +173,15 @@ ID_COL = "MixDesignKey"
 TRAIN_SIZE = 0.70
 VALIDATION_SIZE = 0.10
 TEST_SIZE = 0.20
-# Development data = train + validation = 80%. Locked test = 20%, scored once.
+# Development data = train + validation = 80%. Locked test = 20%.
+
+# ---- LOCKED-TEST SWITCH ----
+# False (current request): DEVELOPMENT-ONLY run. Train on 70%, validate on 10%, check
+#       stability / leakage. The 20% test is split off and saved to its own Excel file but
+#       is NEVER read, scored, explained, or plotted. Results go to a separate DEV-ONLY workbook.
+# True: reveal the locked 20% test ONCE — refit the selected model on the 80% dev set and
+#       score + explain the test a single time (final-evaluation run).
+SCORE_LOCKED_TEST = False
 
 CV_FOLDS = 5
 N_TARGET_BINS = 5
@@ -1567,7 +1575,7 @@ def main():
                     pred_rows.append(pred)
                     folds_rows.append(folds)
                     trained_objects[row["Label"]] = {
-                        "best_estimator": best_est, "fitted": fitted,
+                        "best_estimator": best_est, "fitted": fitted, "cand_pred": pred,
                         "X_train": X_train, "y_train": y_train, "X_val": X_val, "y_val": y_val,
                         "X_test": X_test, "y_test": y_test, "numerical": numerical, "categorical": categorical,
                         "feature_set": fs_name, "model_name": model_name, "best_params": best_params, "folds": folds,
@@ -1623,9 +1631,11 @@ def main():
                                       "Weighted_High_Rut": False, "Measured": np.asarray(ys, float),
                                       "Predicted": np.asarray(ps, float)})
                     pp.append(add_error_columns(d))
-                pred_rows.append(pd.concat(pp, ignore_index=True))
+                stack_pred_df = pd.concat(pp, ignore_index=True)
+                pred_rows.append(stack_pred_df)
                 trained_objects[row["Label"]] = {
-                    "best_estimator": stack, "fitted": stack, "X_train": sc["X_train"], "y_train": sc["y_train"],
+                    "best_estimator": stack, "fitted": stack, "cand_pred": stack_pred_df,
+                    "X_train": sc["X_train"], "y_train": sc["y_train"],
                     "X_val": sc["X_val"], "y_val": sc["y_val"], "X_test": sc["X_test"], "y_test": sc["y_test"],
                     "numerical": sc["numerical"], "categorical": sc["categorical"], "feature_set": sc["feature_set"],
                     "model_name": "StackingRegressor", "best_params": {}, "folds": pd.DataFrame()}
@@ -1673,17 +1683,68 @@ def main():
     print(selected[["Feature_Set", "Model", "Weighted_High_Rut", "TrainOOF_R2", "Validation_R2",
                     "Train_R2", "Gap_TrainMinusValidation_R2", "Robust_Selection_Score"]].to_string())
 
-    final_est, X_dev, y_dev, final_pred_df, final_metrics_df = final_refit_and_test(
-        obj["best_estimator"], obj["X_train"], obj["y_train"], obj["X_val"], obj["y_val"], obj["X_test"], obj["y_test"])
-    final_model_path = PATHS["models"] / "FINAL_SELECTED_MODEL_refit_on_dev80.joblib"
-    joblib.dump(final_est, final_model_path)
-
-    print("\nFinal metrics (LOCKED TEST scored once):")
-    print(final_metrics_df.to_string(index=False))
-
-    # ---- Diagnostics for the final model ----
+    # Series used by RBR-sensitivity / applicability (defined before the branch).
+    band_series_full = df["RBR_band"] if "RBR_band" in df.columns else pd.Series(["NA"] * len(df))
+    rbr_pct_full = pd.to_numeric(df.get("RBR_JMF_percent", pd.Series([np.nan] * len(df))), errors="coerce")
+    rapxac_full = pd.to_numeric(df.get("RAP_pct_x_ACinRAP", pd.Series([np.nan] * len(df))), errors="coerce")
+    is_tree = obj["model_name"] in ["XGBoost", "LightGBM", "HistGradientBoosting", "CatBoost", "GradientBoosting"]
     diag = PATHS["figures"] / "diagnostics"
-    for split in ["Train70", "Validation10", "Dev80_FinalFit", "LockedTest20"]:
+
+    # =========================================================================
+    # BRANCH ON THE LOCKED-TEST SWITCH
+    # =========================================================================
+    if SCORE_LOCKED_TEST:
+        mode_label = "FINAL EVALUATION (locked 20% test revealed once)"
+        print("\n*** SCORE_LOCKED_TEST=True: revealing the locked 20% test ONE TIME. ***")
+        final_est, X_pdp, y_dev, final_pred_df, final_metrics_df = final_refit_and_test(
+            obj["best_estimator"], obj["X_train"], obj["y_train"], obj["X_val"], obj["y_val"],
+            obj["X_test"], obj["y_test"])
+        final_model_path = PATHS["models"] / "FINAL_SELECTED_MODEL_refit_on_dev80.joblib"
+        joblib.dump(final_est, final_model_path)
+        print("\nFinal metrics (LOCKED TEST scored once):")
+        print(final_metrics_df.to_string(index=False))
+        diag_splits = ["Train70", "Validation10", "Dev80_FinalFit", "LockedTest20"]
+        X_explain = pd.concat([obj["X_val"], obj["X_test"]], axis=0).reset_index(drop=True)
+        explain_pred = pd.concat([final_pred_df[final_pred_df["Dataset"] == "Validation10"],
+                                  final_pred_df[final_pred_df["Dataset"] == "LockedTest20"]], ignore_index=True)
+        band_explain = pd.concat([band_series_full.iloc[val_idx], band_series_full.iloc[test_idx]],
+                                 axis=0).reset_index(drop=True)
+        band_split_idx = {"Train70": train_idx, "Validation10": val_idx, "LockedTest20": test_idx}
+        ad_targets = [("Validation10", val_idx), ("LockedTest20", test_idx)]
+        metrics_sheet = "Final_TrainValTest_Metrics"
+        workbook_name = "Rut20k_v2_70_10_20_WITH_LOCKED_TEST_Results.xlsx"
+    else:
+        mode_label = "DEVELOPMENT ONLY (locked 20% test untouched)"
+        print("\n*** SCORE_LOCKED_TEST=False: DEVELOPMENT-ONLY run. "
+              "The 20% test is NOT read, scored, explained, or plotted. ***")
+        # Selected model stays fit on the 70% TRAIN set only; validation is genuinely held out.
+        final_est = obj["fitted"]
+        final_model_path = PATHS["models"] / "SELECTED_MODEL_dev_only_fit_on_train70.joblib"
+        joblib.dump(final_est, final_model_path)
+        final_pred_df = obj["cand_pred"].copy()
+        rows = []
+        for ds, sub in final_pred_df.groupby("Dataset"):
+            m = metrics(sub["Measured"], sub["Predicted"])
+            rel = relative_error_summary(sub["Measured"], sub["Predicted"], "")
+            bf = best_fit(sub["Measured"], sub["Predicted"])
+            rows.append({"Dataset": ds, "Rows": len(sub), **m,
+                         "HighRut_MAE_q80": high_rut_mae(sub["Measured"], sub["Predicted"], 0.80),
+                         **rel, "BestFit_Equation": bf["equation"]})
+        final_metrics_df = pd.DataFrame(rows)
+        print("\nDevelopment metrics (train / train-OOF / validation — NO test):")
+        print(final_metrics_df.to_string(index=False))
+        X_pdp = pd.concat([obj["X_train"], obj["X_val"]], axis=0).reset_index(drop=True)
+        diag_splits = ["Train70", "TrainOOF70", "Validation10"]
+        X_explain = obj["X_val"].reset_index(drop=True)
+        explain_pred = final_pred_df[final_pred_df["Dataset"] == "Validation10"].reset_index(drop=True)
+        band_explain = band_series_full.iloc[val_idx].reset_index(drop=True)
+        band_split_idx = {"Train70": train_idx, "Validation10": val_idx}
+        ad_targets = [("Validation10", val_idx)]
+        metrics_sheet = "Dev_Train_Val_Metrics"
+        workbook_name = "Rut20k_v2_70_10_20_DEV_ONLY_train_val_Results.xlsx"
+
+    # ---- Diagnostics for the selected model (test only touched when SCORE_LOCKED_TEST) ----
+    for split in diag_splits:
         graph_rows += plot_residuals(final_pred_df, split, diag)
     graph_rows += plot_fold_performance(obj.get("folds"), diag)
     graph_rows += plot_learning_curve(obj["best_estimator"], obj["X_train"], obj["y_train"], PATHS["figures"] / "learning")
@@ -1695,35 +1756,21 @@ def main():
 
     perm_df = run_permutation(final_est, obj["X_val"], obj["y_val"], PATHS["figures"] / "feature_sets")
     top_features = list(perm_df["Feature"].head(12)) if not perm_df.empty else list(obj["X_train"].columns[:12])
-    graph_rows += run_pdp(final_est, X_dev, top_features, PATHS["figures"] / "pdp")
+    graph_rows += run_pdp(final_est, X_pdp, top_features, PATHS["figures"] / "pdp")
 
-    # SHAP on validation + test for explanation (test only explained, not used for tuning).
-    X_explain = pd.concat([obj["X_val"], obj["X_test"]], axis=0).reset_index(drop=True)
-    explain_pred = pd.concat([final_pred_df[final_pred_df["Dataset"] == "Validation10"],
-                              final_pred_df[final_pred_df["Dataset"] == "LockedTest20"]], ignore_index=True)
-    is_tree = obj["model_name"] in ["XGBoost", "LightGBM", "HistGradientBoosting", "CatBoost", "GradientBoosting"]
     shap_df, shap_graphs, sv, names_idx = (run_shap(final_est, X_explain, explain_pred, PATHS["figures"] / "shap")
                                            if is_tree else (pd.DataFrame(), [], None, None))
     graph_rows += shap_graphs
 
     # ---- RBR sensitivity + applicability domain ----
-    band_series_full = df["RBR_band"] if "RBR_band" in df.columns else pd.Series(["NA"] * len(df))
-    rbr_pct_full = pd.to_numeric(df.get("RBR_JMF_percent", pd.Series([np.nan] * len(df))), errors="coerce")
-    rapxac_full = pd.to_numeric(df.get("RAP_pct_x_ACinRAP", pd.Series([np.nan] * len(df))), errors="coerce")
-
-    # SHAP by RBR band (validation+test order matches X_explain).
-    band_explain = pd.concat([band_series_full.iloc[val_idx], band_series_full.iloc[test_idx]], axis=0).reset_index(drop=True)
     shap_band_df = shap_by_rbr_band(sv, names_idx, band_explain, PATHS["figures"] / "rbr_sensitivity") if sv is not None else pd.DataFrame()
 
-    # Error by RBR band / rut range, per split (attach grouping cols to predictions).
-    band_by_split = {"Train70": band_series_full.iloc[train_idx].reset_index(drop=True),
-                     "Validation10": band_series_full.iloc[val_idx].reset_index(drop=True),
-                     "LockedTest20": band_series_full.iloc[test_idx].reset_index(drop=True)}
     range_parts, band_parts = [], []
-    for ds, bands in band_by_split.items():
+    for ds, idxs in band_split_idx.items():
         sub = final_pred_df[final_pred_df["Dataset"] == ds].reset_index(drop=True).copy()
         if sub.empty:
             continue
+        bands = band_series_full.iloc[idxs].reset_index(drop=True)
         sub["Rut_Range"] = sub["Measured"].apply(rut_range_label)
         sub["RBR_band"] = bands.values[:len(sub)]
         range_parts.append(error_by_group(sub, "Rut_Range", ds))
@@ -1735,7 +1782,7 @@ def main():
     rbr_hi = AD_RBR_PERCENT_HIGH if AD_RBR_PERCENT_HIGH is not None else float(np.nanquantile(rbr_pct_full.iloc[dev_idx_all], 0.975))
     rapxac_hi = AD_RAPxAC_HIGH if AD_RAPxAC_HIGH is not None else float(np.nanquantile(rapxac_full.iloc[dev_idx_all], 0.975))
     ad_rows = []
-    for ds, idxs in [("Validation10", val_idx), ("LockedTest20", test_idx)]:
+    for ds, idxs in ad_targets:
         sub = final_pred_df[final_pred_df["Dataset"] == ds].reset_index(drop=True).copy()
         if sub.empty:
             continue
@@ -1795,23 +1842,32 @@ def main():
         {"Setting": "True RBR", "Value": "RBR_JMF_fraction (=RBR_decimal), RBR_JMF_percent (=RBR_percent)"},
         {"Setting": "Stacking", "Value": f"{RUN_STACKING} ({list(best_params_for_stack.keys())})"},
         {"Setting": "Selection", "Value": "Validation/Robust score; locked test never used for selection"},
-        {"Setting": "Final fit", "Value": "Selected model refit on 80% dev, tested once on 20% locked test"},
+        {"Setting": "SCORE_LOCKED_TEST", "Value": SCORE_LOCKED_TEST},
+        {"Setting": "Run mode", "Value": mode_label},
+        {"Setting": "Final fit", "Value": ("Selected model refit on 80% dev, tested once on 20% locked test"
+                                           if SCORE_LOCKED_TEST else
+                                           "Selected model fit on 70% train; validated on 10%; 20% test UNTOUCHED")},
     ])
-    final_recommendation = pd.DataFrame([{
+    rec = {
+        "Run_Mode": mode_label,
         "Final_Selected_Label": selected_label, "Selected_Feature_Set": selected["Feature_Set"],
         "Selected_Model": selected["Model"], "Selected_Weighted": selected["Weighted_High_Rut"],
         "Validation_R2": selected["Validation_R2"], "TrainOOF_R2": selected["TrainOOF_R2"],
         "Train_R2": selected["Train_R2"], "Gap_TrainMinusValidation": selected["Gap_TrainMinusValidation_R2"],
-        "LockedTest_R2": float(final_metrics_df.loc[final_metrics_df["Dataset"] == "LockedTest20", "R2"].iloc[0]),
-        "LockedTest_RMSE": float(final_metrics_df.loc[final_metrics_df["Dataset"] == "LockedTest20", "RMSE"].iloc[0]),
-        "LockedTest_MAE": float(final_metrics_df.loc[final_metrics_df["Dataset"] == "LockedTest20", "MAE"].iloc[0]),
         "Final_Model_File": str(final_model_path),
-    }])
+    }
+    if SCORE_LOCKED_TEST:
+        rec["LockedTest_R2"] = float(final_metrics_df.loc[final_metrics_df["Dataset"] == "LockedTest20", "R2"].iloc[0])
+        rec["LockedTest_RMSE"] = float(final_metrics_df.loc[final_metrics_df["Dataset"] == "LockedTest20", "RMSE"].iloc[0])
+        rec["LockedTest_MAE"] = float(final_metrics_df.loc[final_metrics_df["Dataset"] == "LockedTest20", "MAE"].iloc[0])
+    else:
+        rec["LockedTest_R2"] = rec["LockedTest_RMSE"] = rec["LockedTest_MAE"] = "NOT SCORED (test untouched)"
+    final_recommendation = pd.DataFrame([rec])
 
     graph_index_df = pd.DataFrame(graph_rows)
 
-    # ---- Save workbook ----
-    workbook = OUTPUT_FOLDER / "Rut20k_v2_70_10_20_RBR_Results.xlsx"
+    # ---- Save workbook (separate file per run mode) ----
+    workbook = OUTPUT_FOLDER / workbook_name
     with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
         settings_df.to_excel(writer, sheet_name="Settings", index=False)
         split_summary.to_excel(writer, sheet_name="Split_Summary", index=False)
@@ -1821,7 +1877,7 @@ def main():
         if not robust_df.empty:
             robust_df.to_excel(writer, sheet_name="RepeatedCV_Robustness", index=False)
         final_recommendation.to_excel(writer, sheet_name="Final_Selected_Model", index=False)
-        final_metrics_df.to_excel(writer, sheet_name="Final_TrainValTest_Metrics", index=False)
+        final_metrics_df.to_excel(writer, sheet_name=metrics_sheet, index=False)
         final_pred_df.to_excel(writer, sheet_name="Final_Predictions", index=False)
         if not error_by_rut_range.empty:
             error_by_rut_range.to_excel(writer, sheet_name="Error_By_Rut_Range", index=False)
@@ -1853,12 +1909,13 @@ def main():
     final_metrics_df.to_csv(PATHS["tables"] / "final_train_val_test_metrics.csv", index=False)
     final_pred_df.to_csv(PATHS["tables"] / "final_predictions.csv", index=False)
 
+    locked_test_file = PATHS["splits"] / "LOCKED_test_20pct_DO_NOT_USE_FOR_TUNING.xlsx"
     elapsed = time.time() - t0
     print("\n" + "=" * 100)
-    print("FINISHED RUT_20K v2 70/10/20 WORKFLOW")
+    print(f"FINISHED RUT_20K v2 70/10/20 WORKFLOW — {mode_label}")
     print("=" * 100)
     print(f"Workbook: {workbook}")
-    print(f"Final model: {final_model_path}")
+    print(f"Selected model: {final_model_path}")
     print(f"Figures: {PATHS['figures']}")
     print("\nFinal recommendation:")
     print(final_recommendation.to_string(index=False))
@@ -1867,12 +1924,19 @@ def main():
         print(weakness_df.head(6).to_string(index=False))
     print(f"\nElapsed: {elapsed/60:.2f} minutes")
     best_val = float(results_df["Validation_R2"].max())
+    if not SCORE_LOCKED_TEST:
+        print("\n" + "-" * 100)
+        print("DEVELOPMENT-ONLY RUN COMPLETE — the 20% test set was NOT used in any way.")
+        print(f"  It is saved, untouched, in its own Excel file:\n    {locked_test_file}")
+        print("  Use the train / train-OOF / validation metrics, the RepeatedCV_Robustness sheet, the")
+        print("  CV fold stability, and the learning/bias-variance curves to confirm the model is stable")
+        print("  and leakage-free. When you are satisfied, set SCORE_LOCKED_TEST = True and re-run ONCE")
+        print("  to reveal the final locked-test score.")
+        print("-" * 100)
     if best_val < TARGET_VAL_R2:
         print(f"\nNOTE: Best validation R2 = {best_val:.3f} < target {TARGET_VAL_R2:.2f}. "
               "As the advisor doc anticipated, reaching 0.80 likely requires NEW predictors "
-              "(binder rheology, aging, test conditions) rather than further tuning. The best honest "
-              "model and its weak regions are reported above; the 20% test set remained locked until "
-              "the single final evaluation.")
+              "(binder rheology, aging, test conditions) rather than further tuning.")
 
 
 if __name__ == "__main__":

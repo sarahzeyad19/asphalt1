@@ -12,7 +12,7 @@ history in `Rut_20k_Model_Runs_and_Split_Comparison.docx`.
 | Request | Implementation |
 |---|---|
 | Re-split to **70% train / 10% validation / 20% test** | `stratified_70_10_20_split()` — two-stage, target-bin–stratified, `random_state=42` |
-| **Keep the test set hidden** (don't use it) | Test (20%) is split off *first*; never touched in tuning/selection. Scored **once** in `final_refit_and_test()` after refit on the 80% dev set. Saved as `LOCKED_test_20pct_DO_NOT_USE_FOR_TUNING.xlsx`. |
+| **Keep the test set hidden** (don't use it) | Controlled by **`SCORE_LOCKED_TEST`** (default **`False`**). When `False`, this is a *development-only* run: train on 70%, validate on 10%, and the 20% test is split off, saved to its own Excel file, and **never read, scored, explained, or plotted**. Results go to a separate **`..._DEV_ONLY_train_val_Results.xlsx`** workbook. Set it `True` later for a one-time final evaluation (refit on 80% dev, score + SHAP the test once → `..._WITH_LOCKED_TEST_Results.xlsx`). Test rows always saved as `LOCKED_test_20pct_DO_NOT_USE_FOR_TUNING.xlsx`. |
 | **Add the RBR** as a real feature | `RBR_JMF_fraction` (= file's `RBR_decimal`) and `RBR_JMF_percent` (= `RBR_percent`). Used in `VolumetricsB_NoADT_RBR_Both`, `SHAP12/14_RBR`, and the interaction sets. One set *replaces* `RAP_pct_x_ACinRAP` with RBR to measure RBR's standalone value. |
 | **High regularization + highly tuned + robust model** | Shallow trees (`max_depth` 2–3), high `reg_alpha`/`reg_lambda`, low `subsample`/`colsample`, `gamma`, large `min_child_weight`; `RandomizedSearchCV` (n_iter=120) in training-only 5-fold CV; **RepeatedKFold (5×5)** robustness pass on the 80% dev set. |
 | **Best-fit vs 45° line for train AND validation** | `plot_fit()` draws the ideal 1:1 (45°) line and the best-fit regression line for `Train70`, `Validation10` (and `LockedTest20` at the end). |
@@ -77,6 +77,22 @@ In the CPU verification run, the stacking model reached **validation R² ≈ 0.6
 GPU run with `N_ITER_XGB=120` and all feature sets should do at least as well.
 
 ---
+
+## 4b. Two-phase use of the locked test (`SCORE_LOCKED_TEST`)
+
+The 20% test is treated as a one-shot resource, so it is gated behind a single switch:
+
+- **Phase 1 — `SCORE_LOCKED_TEST = False` (default).** Train + validate only. Use this to confirm
+  the model is **stable and leakage-free** via: the held-out validation metrics, the
+  `RepeatedCV_Robustness` sheet (mean ± std over 25 dev folds), `CV_Folds_Train70` fold stability,
+  the learning curve, and the bias-variance curves. The 20% test is saved untouched in
+  `splits/LOCKED_test_20pct_DO_NOT_USE_FOR_TUNING.xlsx` and is **never** opened by the code.
+  Output: `Rut20k_v2_70_10_20_DEV_ONLY_train_val_Results.xlsx`.
+- **Phase 2 — `SCORE_LOCKED_TEST = True`.** Only after you are satisfied. Refits the selected model
+  on the 80% dev set and scores + explains the test **once**.
+  Output: `Rut20k_v2_70_10_20_WITH_LOCKED_TEST_Results.xlsx`.
+
+This guarantees the final test number stays an unbiased estimate — you never tune against it.
 
 ## 5. How to run it
 
