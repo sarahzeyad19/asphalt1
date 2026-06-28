@@ -93,13 +93,16 @@ import pandas as pd
 from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import (
+    ExtraTreesRegressor,
     GradientBoostingRegressor,
     HistGradientBoostingRegressor,
+    RandomForestRegressor,
     StackingRegressor,
 )
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import PartialDependenceDisplay, permutation_importance
-from sklearn.linear_model import RidgeCV
+from sklearn.linear_model import ElasticNet, HuberRegressor, RidgeCV
+from sklearn.svm import SVR
 from sklearn.metrics import (
     auc,
     mean_absolute_error,
@@ -159,6 +162,14 @@ try:
 except Exception:
     variance_inflation_factor = None
     HAS_STATSMODELS = False
+
+try:
+    # Explainable Boosting Machine (glass-box GAM): pip install interpret
+    from interpret.glassbox import ExplainableBoostingRegressor
+    HAS_EBM = True
+except Exception:
+    ExplainableBoostingRegressor = None
+    HAS_EBM = False
 
 
 # =============================================================================
@@ -877,11 +888,95 @@ def define_models(feature_set: str) -> Dict[str, Dict[str, Any]]:
                 "model__random_strength": [0.5, 1.0, 2.0, 4.0],
             },
         }
+
+    # ---- Additional HIGH-ROBUSTNESS models (bagging, robust/penalized linear, SVR, EBM) ----
+    rbr_or_shap = ["VolumetricsB_NoADT_RBR_Both", "SHAP12_RBR"]
+    if feature_set in rbr_or_shap:
+        # Extremely randomized trees: lowest-variance, hardest-to-overfit tree model.
+        models["ExtraTrees"] = {
+            "estimator": ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=N_JOBS_MODEL),
+            "n_iter": N_ITER_OTHER, "scale": False,
+            "params": {
+                "model__n_estimators": [400, 800],
+                "model__max_depth": [None, 8, 16],
+                "model__min_samples_leaf": [1, 5, 10, 20],
+                "model__max_features": ["sqrt", 0.5, 0.8],
+            },
+        }
+        # Penalized linear model: near-zero overfit risk, robust baseline.
+        models["ElasticNet"] = {
+            "estimator": ElasticNet(max_iter=10000, random_state=RANDOM_STATE),
+            "n_iter": N_ITER_OTHER, "scale": True,
+            "params": {
+                "model__alpha": [0.001, 0.01, 0.05, 0.1, 0.5, 1.0],
+                "model__l1_ratio": [0.1, 0.3, 0.5, 0.7, 0.9],
+            },
+        }
+    if feature_set == "VolumetricsB_NoADT_RBR_Both":
+        models["RandomForest"] = {
+            "estimator": RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=N_JOBS_MODEL),
+            "n_iter": N_ITER_OTHER, "scale": False,
+            "params": {
+                "model__n_estimators": [400, 800],
+                "model__max_depth": [None, 8, 16],
+                "model__min_samples_leaf": [1, 5, 10, 20],
+                "model__max_features": ["sqrt", 0.5, 0.8],
+            },
+        }
+        # Huber-loss boosting: down-weights the heavy-tail residuals (high-rut/low-rut extremes).
+        models["GradientBoostingHuber"] = {
+            "estimator": GradientBoostingRegressor(random_state=RANDOM_STATE, loss="huber"),
+            "n_iter": N_ITER_OTHER, "scale": False,
+            "params": {
+                "model__n_estimators": [300, 500, 800],
+                "model__learning_rate": [0.02, 0.03, 0.05],
+                "model__max_depth": [2, 3],
+                "model__subsample": [0.70, 0.85],
+                "model__min_samples_leaf": [10, 20],
+            },
+        }
+    if feature_set == "SHAP12_RBR":
+        # Robust linear regression (outlier-resistant) and RBF SVR for small noisy data.
+        models["HuberRegressor"] = {
+            "estimator": HuberRegressor(max_iter=2000),
+            "n_iter": N_ITER_OTHER, "scale": True,
+            "params": {
+                "model__epsilon": [1.1, 1.35, 1.5, 2.0],
+                "model__alpha": [1e-4, 1e-3, 1e-2, 1e-1],
+            },
+        }
+        models["SVR_RBF"] = {
+            "estimator": SVR(kernel="rbf"),
+            "n_iter": N_ITER_OTHER, "scale": True,
+            "params": {
+                "model__C": [1, 10, 50, 100],
+                "model__gamma": ["scale", 0.01, 0.05, 0.1],
+                "model__epsilon": [0.1, 0.3, 0.5],
+            },
+        }
+        if HAS_EBM:
+            # Explainable Boosting Machine: glass-box GAM, robust + fully interpretable.
+            models["EBM"] = {
+                "estimator": ExplainableBoostingRegressor(random_state=RANDOM_STATE),
+                "n_iter": min(N_ITER_OTHER, 8), "scale": False,
+                "params": {
+                    "model__interactions": [0, 5, 10],
+                    "model__learning_rate": [0.01, 0.02],
+                    "model__max_bins": [128, 256],
+                },
+            }
+
     return {k: v for k, v in models.items() if v["estimator"] is not None}
 
 
-def build_pipeline(estimator, numerical, categorical) -> Pipeline:
-    return Pipeline([("preprocess", build_preprocessor(numerical, categorical)), ("model", estimator)])
+def build_pipeline(estimator, numerical, categorical, scale: bool = False) -> Pipeline:
+    # scale=True inserts StandardScaler after preprocessing for distance/penalty-based models
+    # (ElasticNet, Huber, SVR). Tree models do not need it.
+    steps = [("preprocess", build_preprocessor(numerical, categorical))]
+    if scale:
+        steps.append(("scale", StandardScaler()))
+    steps.append(("model", estimator))
+    return Pipeline(steps)
 
 
 def fit_search_with_gpu_fallback(model_name, pipe, params, n_iter, X, y, cv_splits, sample_weight=None):
@@ -966,7 +1061,7 @@ def nested_cv(feature_set, model_name, X_dev, y_dev, numerical, categorical):
         Xtr, Xte = X_dev.iloc[tr], X_dev.iloc[te]
         ytr, yte = y_dev.iloc[tr], y_dev.iloc[te]
         inner = KFold(n_splits=NESTED_CV_INNER_SPLITS, shuffle=True, random_state=RANDOM_STATE + i)
-        pipe = build_pipeline(clone(spec["estimator"]), numerical, categorical)
+        pipe = build_pipeline(clone(spec["estimator"]), numerical, categorical, scale=spec.get("scale", False))
         try:
             search = RandomizedSearchCV(pipe, spec["params"], n_iter=n_iter, scoring="r2", cv=inner,
                                         random_state=RANDOM_STATE, n_jobs=N_JOBS_SEARCH, error_score=np.nan)
@@ -993,7 +1088,7 @@ def train_candidate(feature_set, model_name, model_spec, X_train, y_train, X_val
                     numerical, categorical, cv_splits, cv_name, weighted=False):
     wtxt = " | high-rut weighted" if weighted else ""
     print(f"  Training {feature_set} | {model_name}{wtxt}")
-    pipe = build_pipeline(clone(model_spec["estimator"]), numerical, categorical)
+    pipe = build_pipeline(clone(model_spec["estimator"]), numerical, categorical, scale=model_spec.get("scale", False))
     weights = rut_sample_weights(y_train) if weighted and model_name == "XGBoost" else None
     search, device_used = fit_search_with_gpu_fallback(
         model_name, pipe, model_spec["params"], model_spec["n_iter"], X_train, y_train, cv_splits, sample_weight=weights)
@@ -1063,7 +1158,15 @@ def build_stacking(best_params_by_model: Dict[str, Dict[str, Any]], numerical, c
             base = HistGradientBoostingRegressor(random_state=RANDOM_STATE, loss="squared_error")
         elif name == "CatBoost" and HAS_CATBOOST:
             base = make_catboost(USE_GPU)
+        elif name == "ExtraTrees":
+            base = ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=N_JOBS_MODEL)
+        elif name == "RandomForest":
+            base = RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=N_JOBS_MODEL)
+        elif name == "GradientBoostingHuber":
+            base = GradientBoostingRegressor(random_state=RANDOM_STATE, loss="huber")
         else:
+            # Penalized/robust-linear, SVR, EBM: kept as standalone candidates, not stacked
+            # (they would need scaling inside the stack); skip to keep the ensemble tree-only.
             continue
         try:
             base.set_params(**clean)

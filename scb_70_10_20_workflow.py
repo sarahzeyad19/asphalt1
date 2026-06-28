@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RUT_20K MODELING WORKFLOW v2 — 70/10/20 LOCKED TEST + TRUE RBR + HIGH REGULARIZATION
+SCB MODELING WORKFLOW v2 — 70/10/20 LOCKED TEST + TRUE RBR + HIGH REGULARIZATION
                                + STACKING + REPEATED-CV ROBUSTNESS + FULL DIAGNOSTICS
                                + RBR-RANGE SENSITIVITY + APPLICABILITY DOMAIN
 Author: Updated for Sarah Al-Jezawi
@@ -177,12 +177,13 @@ except Exception:
 # =============================================================================
 
 RANDOM_STATE = 42
-TARGET = "Rut_20k"
+TARGET = "SCB"
+TARGET_UNITS = ""   # SCB is unitless (mm for rutting); used in plot axis labels
 ID_COL = "MixDesignKey"
 
 # ---- DATA SPLIT (only thing that differs between the two delivered scripts) ----
-TRAIN_SIZE = 0.65
-VALIDATION_SIZE = 0.15
+TRAIN_SIZE = 0.70
+VALIDATION_SIZE = 0.10
 TEST_SIZE = 0.20
 # Development data = train + validation. Locked test is held out.
 SPLIT_TAG = f"{int(TRAIN_SIZE*100)}_{int(VALIDATION_SIZE*100)}_{int(TEST_SIZE*100)}"
@@ -254,7 +255,7 @@ RUN_SHAP = True
 RUN_PDP = True
 RUN_LEARNING_CURVE = True
 RUN_BIAS_VARIANCE_CURVES = True
-RUN_ROC_RISK_SCREENING = True
+RUN_ROC_RISK_SCREENING = False
 RUT_RISK_THRESHOLD_MM = 6.0
 MAX_SHAP_ROWS = 700
 MAX_PDP_FEATURES = 8
@@ -266,16 +267,16 @@ QUICK_SMOKE_TEST = False
 # ---- Input file resolution ----
 HOME = Path.home()
 DOWNLOADS = HOME / "Downloads"
-RUT_FILENAME = "Rutting_Cleaned_with_RBR.xlsx"
+RUT_FILENAME = "SCB_Cleaned_with_RBR.xlsx"
 RUT_FILE = DOWNLOADS / RUT_FILENAME
 RUT_FILE_FALLBACKS = [
-    DOWNLOADS / "725e0ea2-Rutting_Cleaned_with_RBR.xlsx",
-    DOWNLOADS / "Rutting_Cleaned_with_RBR (1).xlsx",
-    DOWNLOADS / "Rutting_Cleaned_SpecBased.xlsx",
+    DOWNLOADS / "725e0ea2-SCB_Cleaned_with_RBR.xlsx",
+    DOWNLOADS / "SCB_Cleaned_with_RBR (1).xlsx",
+    DOWNLOADS / "SCB_Cleaned.xlsx",
 ]
 SHEET_CANDIDATES = ["Cleaned_With_RBR", "Cleaned_Dataset", "Cleaned_Data_Kept", "Sheet1", 0]
 
-OUTPUT_FOLDER = DOWNLOADS / f"Rut20k_v3_{SPLIT_TAG}_RBR_outputs"
+OUTPUT_FOLDER = DOWNLOADS / f"SCB_v3_{SPLIT_TAG}_RBR_outputs"
 
 if QUICK_SMOKE_TEST:
     N_ITER_XGB = 8
@@ -363,11 +364,11 @@ def resolve_file_path(path: Path, fallbacks: List[Path]) -> Path:
     try:
         script_dir = Path(__file__).resolve().parent
         candidates += [script_dir / p.name for p in list(candidates)]
-        candidates += list(script_dir.glob("*Rutting_Cleaned_with_RBR*.xlsx"))
+        candidates += list(script_dir.glob("*SCB_Cleaned_with_RBR*.xlsx"))
     except Exception:
         pass
     candidates += [Path.cwd() / p.name for p in list(candidates)]
-    candidates += list(Path.cwd().glob("*Rutting_Cleaned_with_RBR*.xlsx"))
+    candidates += list(Path.cwd().glob("*SCB_Cleaned_with_RBR*.xlsx"))
     seen, out = set(), []
     for p in candidates:
         if str(p) in seen:
@@ -376,7 +377,7 @@ def resolve_file_path(path: Path, fallbacks: List[Path]) -> Path:
         if p.exists():
             return p
     raise FileNotFoundError(
-        "Could not find the Rutting Excel file. Put 'Rutting_Cleaned_with_RBR.xlsx' in your "
+        "Could not find the Rutting Excel file. Put 'SCB_Cleaned_with_RBR.xlsx' in your "
         "Downloads folder or next to this script. Tried:\n" + "\n".join(str(p) for p in candidates[:12])
     )
 
@@ -602,6 +603,8 @@ def load_data() -> Tuple[pd.DataFrame, pd.Series, Path]:
     mask = y.notna()
     df = df.loc[mask].reset_index(drop=True)
     y = y.loc[mask].reset_index(drop=True)
+    global _RANGE_CUTS
+    _RANGE_CUTS = (float(np.nanquantile(y, 1 / 3)), float(np.nanquantile(y, 2 / 3)))
     print("\n" + "=" * 100)
     print(f"Loaded {TARGET} data")
     print("=" * 100)
@@ -775,14 +778,20 @@ def robust_score(validation_r2, oof_r2, gap, fold_sd, n_features) -> float:
                  - 0.20 * fold_sd - 0.002 * n_features)
 
 
+# SCB has no fixed engineering bands (unlike rutting's mm thresholds), so error-by-range uses
+# tertiles of the SCB distribution, set once from the data in load_data().
+_RANGE_CUTS = None  # (q33, q66)
+
+
 def rut_range_label(y: float) -> str:
-    if y < 2:
-        return "Low <2 mm"
-    if y < 5:
-        return "Medium 2-5 mm"
-    if y < 7:
-        return "High 5-7 mm"
-    return "Very high >7 mm"
+    if _RANGE_CUTS is None or not np.isfinite(y):
+        return "all"
+    lo, hi = _RANGE_CUTS
+    if y < lo:
+        return f"Low (<{lo:.3g})"
+    if y < hi:
+        return f"Medium ({lo:.3g}-{hi:.3g})"
+    return f"High (>{hi:.3g})"
 
 
 def error_by_group(pred_df: pd.DataFrame, group_col: str, label: str) -> pd.DataFrame:
@@ -833,21 +842,23 @@ def define_models(feature_set: str) -> Dict[str, Dict[str, Any]]:
     """High-regularization, shallow-tree grids per the advisor plan."""
     models: Dict[str, Dict[str, Any]] = {}
     if HAS_XGBOOST:
-        # Stronger regularization to shrink the train-validation gap (low LR + more trees,
-        # shallow depth, large min_child_weight, high L1/L2, gamma, aggressive subsampling).
+        # Regularization grid SCALED for SCB's small target range (~0.46-1.45). The rutting
+        # script uses much higher reg_lambda (30-120); on SCB that L2 swamps the tiny leaf
+        # gradients and XGBoost collapses to predicting the mean, so here lambda/alpha are
+        # smaller, learning rate a bit higher, and min_child_weight lower.
         models["XGBoost"] = {
             "estimator": make_xgb(USE_GPU),
             "n_iter": N_ITER_XGB,
             "params": {
-                "model__n_estimators": [600, 900, 1200],
-                "model__learning_rate": [0.01, 0.015, 0.02],
+                "model__n_estimators": [400, 600, 900],
+                "model__learning_rate": [0.02, 0.03, 0.05],
                 "model__max_depth": [2, 3],
-                "model__min_child_weight": [15, 20, 30, 40],
+                "model__min_child_weight": [3, 5, 10, 15],
                 "model__subsample": [0.60, 0.70, 0.80],
-                "model__colsample_bytree": [0.50, 0.60, 0.70],
-                "model__gamma": [0.10, 0.20, 0.30],
-                "model__reg_alpha": [1.0, 2.0, 4.0, 8.0],
-                "model__reg_lambda": [30, 50, 80, 120],
+                "model__colsample_bytree": [0.50, 0.70, 0.90],
+                "model__gamma": [0.0, 0.05, 0.10],
+                "model__reg_alpha": [0.0, 0.5, 1.0, 2.0],
+                "model__reg_lambda": [0.5, 1.0, 5.0, 10.0, 20.0],
                 "model__max_bin": [128, 256],
             },
         }
@@ -1249,8 +1260,9 @@ def plot_fit(y_true, y_pred, title, units, path) -> Dict[str, Any]:
     if np.isfinite(bf["slope"]):
         xs = np.linspace(mn, mx, 100)
         plt.plot(xs, bf["slope"] * xs + bf["intercept"], linewidth=2, label="Best-fit line")
-    plt.xlabel(f"Measured {TARGET} ({units})")
-    plt.ylabel(f"Predicted {TARGET} ({units})")
+    u = f" ({units})" if units else ""
+    plt.xlabel(f"Measured {TARGET}{u}")
+    plt.ylabel(f"Predicted {TARGET}{u}")
     plt.title(f"{title}\nR2={m['R2']:.3f}, RMSE={m['RMSE']:.3f}, MAE={m['MAE']:.3f}\n{bf['equation']}")
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -1275,22 +1287,22 @@ def plot_residuals(pred_df, split_name, out_dir) -> List[Dict[str, Any]]:
     if d.empty:
         return graphs
     base = safe_name(split_name)
-    graphs.append(plot_fit(d["Measured"], d["Predicted"], f"{split_name} measured vs predicted", "mm",
+    graphs.append(plot_fit(d["Measured"], d["Predicted"], f"{split_name} measured vs predicted", TARGET_UNITS,
                            out_dir / f"{base}_best_fit.png"))
-    for xcol, xlab, suffix in [("Predicted", "Predicted Rut_20k (mm)", "vs_predicted"),
-                                ("Measured", "Measured Rut_20k (mm)", "vs_measured")]:
+    for xcol, xlab, suffix in [("Predicted", f"Predicted {TARGET}", "vs_predicted"),
+                                ("Measured", f"Measured {TARGET}", "vs_measured")]:
         plt.figure(figsize=(7, 5))
         plt.scatter(d[xcol], d["Residual"], alpha=0.6, s=22)
         plt.axhline(0, ls="--", lw=2)
         plt.xlabel(xlab)
-        plt.ylabel("Residual: predicted - measured (mm)")
+        plt.ylabel("Residual: predicted - measured")
         plt.title(f"{split_name} residuals {suffix.replace('_', ' ')}")
         plt.grid(True, alpha=0.3)
         p = out_dir / f"{base}_residuals_{suffix}.png"
         save_fig(p)
         graphs.append({"Graph": p.name, "Type": f"Residuals {suffix}"})
     p = out_dir / f"{base}_residual_histogram.png"
-    plot_hist(d["Residual"], f"{split_name} residual distribution", "Residual (mm)", p)
+    plot_hist(d["Residual"], f"{split_name} residual distribution", "Residual", p)
     graphs.append({"Graph": p.name, "Type": "Residual histogram"})
     p = out_dir / f"{base}_abs_relative_error_hist.png"
     plot_hist(d["Abs_Relative_Error_pct"], f"{split_name} absolute relative error", "Absolute relative error (%)", p)
@@ -1298,7 +1310,7 @@ def plot_residuals(pred_df, split_name, out_dir) -> List[Dict[str, Any]]:
     plt.figure(figsize=(7, 5))
     plt.scatter(d["Measured"], d["Relative_Error_pct"], alpha=0.6, s=22)
     plt.axhline(0, ls="--", lw=2)
-    plt.xlabel("Measured Rut_20k (mm)")
+    plt.xlabel(f"Measured {TARGET}")
     plt.ylabel("Relative error (%)")
     plt.title(f"{split_name} relative error vs measured")
     plt.grid(True, alpha=0.3)
@@ -1669,7 +1681,7 @@ def final_refit_and_test(final_estimator, X_train, y_train, X_val, y_val, X_test
 def main():
     t0 = time.time()
     print("=" * 100)
-    print("RUT_20K WORKFLOW v2 — 70/10/20 + TRUE RBR + HIGH REG + STACKING + FULL DIAGNOSTICS")
+    print("SCB WORKFLOW v2 — 70/10/20 + TRUE RBR + HIGH REG + STACKING + FULL DIAGNOSTICS")
     print("=" * 100)
     print(f"Goal: push validation R2 toward {TARGET_VAL_R2:.2f}; keep the 20% test locked/hidden.")
     print(gpu_status_string())
@@ -1906,7 +1918,7 @@ def main():
         band_split_idx = {"Train70": train_idx, "Validation10": val_idx, "LockedTest20": test_idx}
         ad_targets = [("Validation10", val_idx), ("LockedTest20", test_idx)]
         metrics_sheet = "Final_TrainValTest_Metrics"
-        workbook_name = f"Rut20k_v3_{SPLIT_TAG}_WITH_LOCKED_TEST_Results.xlsx"
+        workbook_name = f"SCB_v3_{SPLIT_TAG}_WITH_LOCKED_TEST_Results.xlsx"
     else:
         mode_label = "DEVELOPMENT ONLY (locked 20% test untouched)"
         print("\n*** SCORE_LOCKED_TEST=False: DEVELOPMENT-ONLY run. "
@@ -1935,7 +1947,7 @@ def main():
         band_split_idx = {"Train70": train_idx, "Validation10": val_idx}
         ad_targets = [("Validation10", val_idx)]
         metrics_sheet = "Dev_Train_Val_Metrics"
-        workbook_name = f"Rut20k_v3_{SPLIT_TAG}_DEV_ONLY_train_val_Results.xlsx"
+        workbook_name = f"SCB_v3_{SPLIT_TAG}_DEV_ONLY_train_val_Results.xlsx"
 
     # ---- Diagnostics for the selected model (test only touched when SCORE_LOCKED_TEST) ----
     for split in diag_splits:
@@ -2063,20 +2075,20 @@ def main():
 
     # ---- "How to reach R2 >= 0.80" data-collection recommendation ----
     data_reco_df = pd.DataFrame([
-        {"Priority": 1, "New_Predictor": "Continuous PG / binder rheology (DSR G*/sin d)",
-         "Why": "Binder stiffness governs rutting; current PG is a rounded 67-76 integer."},
-        {"Priority": 2, "New_Predictor": "Binder aging state (RTFO / PAV)",
-         "Why": "Aged binder resists rutting; not captured today."},
-        {"Priority": 3, "New_Predictor": "LWT test temperature",
-         "Why": "Rutting is highly temperature dependent; missing as a feature."},
+        {"Priority": 1, "New_Predictor": "Binder low/intermediate-temp rheology (BBR, DSR, delta-Tc)",
+         "Why": "Cracking resistance (SCB) is governed by binder ductility/relaxation at intermediate temperature, not captured by the high-temp PG grade alone."},
+        {"Priority": 2, "New_Predictor": "Binder aging state (RTFO / PAV) and RAP binder stiffness",
+         "Why": "Aging and stiff RAP binder embrittle the mix and lower SCB fracture energy."},
+        {"Priority": 3, "New_Predictor": "SCB test temperature",
+         "Why": "Fracture energy is strongly temperature dependent; missing as a feature."},
         {"Priority": 4, "New_Predictor": "Effective binder content / film thickness (Pbe)",
-         "Why": "Separates total AC from absorbed AC; drives rutting susceptibility."},
-        {"Priority": 5, "New_Predictor": "Traffic level as numeric ESALs",
-         "Why": "Load magnitude; only a coarse category exists now."},
-        {"Priority": 6, "New_Predictor": "Aggregate source / mineralogy",
-         "Why": "Angularity and texture affect shear resistance."},
-        {"Priority": "Note", "New_Predictor": "Feature engineering on the current 18 columns",
-         "Why": "Elbow curve shows OOF flat at ~0.50 regardless of feature count -> the ceiling is the data, not the features."},
+         "Why": "More effective binder generally improves cracking resistance."},
+        {"Priority": 5, "New_Predictor": "RAP/RAS source and blend ratio details",
+         "Why": "Recycled-binder availability and blending drive embrittlement."},
+        {"Priority": 6, "New_Predictor": "Aggregate source / mineralogy / angularity",
+         "Why": "Affects crack propagation and interlock."},
+        {"Priority": "Note", "New_Predictor": "Feature engineering on the current columns",
+         "Why": "As with the rutting model, adding combinations of existing columns hits a ceiling; new physical/binder measurements are the lever."},
     ])
 
     graph_index_df = pd.DataFrame(graph_rows)
@@ -2132,7 +2144,7 @@ def main():
     locked_test_file = PATHS["splits"] / "LOCKED_test_20pct_DO_NOT_USE_FOR_TUNING.xlsx"
     elapsed = time.time() - t0
     print("\n" + "=" * 100)
-    print(f"FINISHED RUT_20K v2 70/10/20 WORKFLOW — {mode_label}")
+    print(f"FINISHED SCB v2 70/10/20 WORKFLOW — {mode_label}")
     print("=" * 100)
     print(f"Workbook: {workbook}")
     print(f"Selected model: {final_model_path}")
