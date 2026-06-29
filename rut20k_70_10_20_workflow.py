@@ -227,7 +227,8 @@ RUN_HIGH_RUT_WEIGHTING = False
 #   space symmetrises the target -> better high-value behaviour and a smaller gap. All metrics,
 #   best-fit lines, residuals and plots are reported back on the ORIGINAL scale.
 AVERAGE_REPLICATES = False
-LOG_TARGET = True
+LOG_TARGET = False  # raw target. (Log lowered rutting numbers — the target isn't skewed enough
+                    # to benefit. Set True only for a strongly right-skewed target like SCB.)
 
 # ---- FORCE the final interpretable model (so SHAP/PDP run on a single tree model) ----
 # The Stacking ensemble cannot be SHAP-explained, so we lock the headline model to a single
@@ -253,6 +254,24 @@ USE_GPU = True
 GPU_DEVICE = "0"
 GPU_FALLBACK_TO_CPU = True
 USE_LIGHTGBM_GPU = False
+
+
+def _nvidia_gpu_available() -> bool:
+    """True only if an NVIDIA GPU is actually usable (nvidia-smi present and returns 0)."""
+    try:
+        import shutil as _sh, subprocess as _sp
+        if _sh.which("nvidia-smi") is None:
+            return False
+        return _sp.run(["nvidia-smi"], capture_output=True, timeout=10).returncode == 0
+    except Exception:
+        return False
+
+
+# Auto-disable GPU when no usable GPU is present, so the SAME file runs cleanly on a GPU laptop
+# AND a CPU-only machine (no CatBoost CUDA tracebacks). Set USE_GPU=False to force CPU always.
+if USE_GPU and not _nvidia_gpu_available():
+    print("USE_GPU=True but no usable NVIDIA GPU detected -> running on CPU.")
+    USE_GPU = False
 
 # Targets from the advisor decision table.
 TARGET_VAL_R2 = 0.80
