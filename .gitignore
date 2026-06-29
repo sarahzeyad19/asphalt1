@@ -1,0 +1,8 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Generated model outputs (workbooks, figures, splits, joblib models)
+*_outputs/
+*.joblib
