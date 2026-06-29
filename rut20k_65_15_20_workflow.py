@@ -226,7 +226,7 @@ RUN_HIGH_RUT_WEIGHTING = False
 #   high ones); the model "compresses" the high tail (best-fit slope < 1). Modelling in log
 #   space symmetrises the target -> better high-value behaviour and a smaller gap. All metrics,
 #   best-fit lines, residuals and plots are reported back on the ORIGINAL scale.
-AVERAGE_REPLICATES = True
+AVERAGE_REPLICATES = False
 LOG_TARGET = True
 
 # ---- FORCE the final interpretable model (so SHAP/PDP run on a single tree model) ----

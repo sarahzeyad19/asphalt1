@@ -225,7 +225,7 @@ RUN_HIGH_RUT_WEIGHTING = False
 # LOG_TARGET: train on log1p(target). The target is right-skewed; modelling in log space
 #   symmetrises it and reduces the high-value compression. All metrics/plots are reported
 #   back on the ORIGINAL scale.
-AVERAGE_REPLICATES = True
+AVERAGE_REPLICATES = False
 LOG_TARGET = True
 
 # ---- FORCE the final interpretable model (so SHAP/PDP run on a single tree model) ----
