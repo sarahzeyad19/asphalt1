@@ -928,21 +928,23 @@ def define_models(feature_set: str) -> Dict[str, Dict[str, Any]]:
     """High-regularization, shallow-tree grids per the advisor plan."""
     models: Dict[str, Dict[str, Any]] = {}
     if HAS_XGBOOST:
-        # Stronger regularization to shrink the train-validation gap (low LR + more trees,
-        # shallow depth, large min_child_weight, high L1/L2, gamma, aggressive subsampling).
+        # Regularization grid SPANS light->heavy so the tuner adapts to the target scale.
+        # (L1/L2 and gamma are penalties in TARGET units, so when LOG_TARGET shrinks the scale
+        #  a fixed-heavy lambda over-penalises and XGBoost underfits. Including small values lets
+        #  RandomizedSearchCV pick the right strength whether log is on or off.)
         models["XGBoost"] = {
             "estimator": make_xgb(USE_GPU),
             "n_iter": N_ITER_XGB,
             "params": {
                 "model__n_estimators": [600, 900, 1200],
-                "model__learning_rate": [0.01, 0.015, 0.02],
-                "model__max_depth": [2, 3],
-                "model__min_child_weight": [15, 20, 30, 40],
+                "model__learning_rate": [0.01, 0.015, 0.02, 0.03],
+                "model__max_depth": [2, 3, 4],
+                "model__min_child_weight": [5, 10, 20, 30],
                 "model__subsample": [0.60, 0.70, 0.80],
                 "model__colsample_bytree": [0.50, 0.60, 0.70],
-                "model__gamma": [0.10, 0.20, 0.30],
-                "model__reg_alpha": [1.0, 2.0, 4.0, 8.0],
-                "model__reg_lambda": [30, 50, 80, 120],
+                "model__gamma": [0.0, 0.05, 0.15, 0.30],
+                "model__reg_alpha": [0.0, 0.5, 2.0, 5.0],
+                "model__reg_lambda": [1, 5, 15, 40, 80],
                 "model__max_bin": [128, 256],
             },
         }
