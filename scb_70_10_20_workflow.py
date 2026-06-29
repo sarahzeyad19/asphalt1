@@ -91,7 +91,7 @@ import numpy as np
 import pandas as pd
 
 from sklearn.base import clone
-from sklearn.compose import ColumnTransformer
+from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
 from sklearn.ensemble import (
     ExtraTreesRegressor,
     GradientBoostingRegressor,
@@ -216,6 +216,17 @@ RUN_STACKING = True
 
 # High-rut sample weighting sensitivity. Turned OFF: it lowered validation R2 every time.
 RUN_HIGH_RUT_WEIGHTING = False
+
+# ---- Option B (Tier 2) data-quality levers: squeeze the most out of the current data ----
+# AVERAGE_REPLICATES: the same mix (MixDesignKey) is tested several times with different
+#   measured values (measurement noise). Collapsing each mix to ONE row with the AVERAGED
+#   target gives a cleaner, more stable target -> usually higher R2 + smaller train/val gap.
+#   It also removes replicate leakage (after averaging every mix is one unique row).
+# LOG_TARGET: train on log1p(target). The target is right-skewed; modelling in log space
+#   symmetrises it and reduces the high-value compression. All metrics/plots are reported
+#   back on the ORIGINAL scale.
+AVERAGE_REPLICATES = True
+LOG_TARGET = True
 
 # ---- FORCE the final interpretable model (so SHAP/PDP run on a single tree model) ----
 # The Stacking ensemble cannot be SHAP-explained, so we lock the headline model to a single
@@ -600,6 +611,20 @@ def load_data() -> Tuple[pd.DataFrame, pd.Series, Path]:
     df = create_engineered_columns(df)
     if TARGET not in df.columns:
         raise KeyError(f"Target {TARGET!r} not found. Columns: {list(df.columns)[:30]}")
+    df = df.loc[pd.to_numeric(df[TARGET], errors="coerce").notna()].reset_index(drop=True)
+
+    # ---- Option B: collapse replicate tests of the same mix into one averaged row ----
+    if AVERAGE_REPLICATES and ID_COL in df.columns:
+        before = len(df)
+        agg = {}
+        for c in df.columns:
+            if c == ID_COL:
+                continue
+            agg[c] = "mean" if pd.api.types.is_numeric_dtype(df[c]) else "first"
+        df = df.groupby(ID_COL, as_index=False).agg(agg)
+        print(f"Replicate averaging ON: {before} test rows -> {len(df)} unique mixes "
+              f"(one averaged target per mix; removes replicate leakage).")
+
     y = pd.to_numeric(df[TARGET], errors="coerce")
     mask = y.notna()
     df = df.loc[mask].reset_index(drop=True)
@@ -609,6 +634,7 @@ def load_data() -> Tuple[pd.DataFrame, pd.Series, Path]:
     print("\n" + "=" * 100)
     print(f"Loaded {TARGET} data")
     print("=" * 100)
+    print(f"Replicate averaging: {AVERAGE_REPLICATES} | Log-target: {LOG_TARGET}")
     print(f"File: {path}")
     print(f"Rows: {len(df)} | Columns after engineering: {df.shape[1]}")
     has_rbr = "RBR_JMF_fraction" in df.columns
@@ -1001,22 +1027,51 @@ def define_models(feature_set: str) -> Dict[str, Dict[str, Any]]:
     return {k: v for k, v in models.items() if v["estimator"] is not None}
 
 
-def build_pipeline(estimator, numerical, categorical, scale: bool = False) -> Pipeline:
-    # scale=True inserts StandardScaler after preprocessing for distance/penalty-based models
-    # (ElasticNet, Huber, SVR). Tree models do not need it.
+# ---- Log-target helpers (Option B): wrap the pipeline in a TransformedTargetRegressor so it
+#      TRAINS on log1p(y) but PREDICTS on the original scale (metrics/plots unchanged). ----
+
+def maybe_log_wrap(estimator):
+    if LOG_TARGET:
+        return TransformedTargetRegressor(regressor=estimator, func=np.log1p, inverse_func=np.expm1)
+    return estimator
+
+
+def log_param_grid(params: Dict[str, Any]) -> Dict[str, Any]:
+    if LOG_TARGET:
+        return {f"regressor__{k}": v for k, v in params.items()}
+    return params
+
+
+def sw_key() -> str:
+    """sample_weight fit-kwarg key, prefixed when the pipeline is target-log-wrapped."""
+    return "regressor__model__sample_weight" if LOG_TARGET else "model__sample_weight"
+
+
+def unwrap_pipeline(est):
+    """Return the inner sklearn Pipeline whether or not it's wrapped in a TransformedTargetRegressor."""
+    if isinstance(est, TransformedTargetRegressor):
+        return getattr(est, "regressor_", est.regressor)
+    return est
+
+
+def build_pipeline(estimator, numerical, categorical, scale: bool = False, wrap: bool = True) -> Pipeline:
+    # wrap=False keeps a RAW pipeline (used for stacking base learners, so the log wrap is
+    # applied ONCE around the whole ensemble instead of around every base learner).
     steps = [("preprocess", build_preprocessor(numerical, categorical))]
     if scale:
         steps.append(("scale", StandardScaler()))
     steps.append(("model", estimator))
-    return Pipeline(steps)
+    pipe = Pipeline(steps)
+    return maybe_log_wrap(pipe) if wrap else pipe
 
 
 def fit_search_with_gpu_fallback(model_name, pipe, params, n_iter, X, y, cv_splits, sample_weight=None):
+    params = log_param_grid(params)  # add "regressor__" prefix when the pipeline is log-wrapped
     space_size = int(np.prod([len(v) for v in params.values()])) if params else 1
     n_iter = min(n_iter, max(1, space_size))
     fit_kwargs = {}
     if sample_weight is not None:
-        fit_kwargs["model__sample_weight"] = sample_weight
+        fit_kwargs[sw_key()] = sample_weight
 
     def _make_search(pp):
         return RandomizedSearchCV(estimator=pp, param_distributions=params, n_iter=n_iter,
@@ -1031,7 +1086,8 @@ def fit_search_with_gpu_fallback(model_name, pipe, params, n_iter, X, y, cv_spli
         if USE_GPU and GPU_FALLBACK_TO_CPU and model_name in ["XGBoost", "CatBoost"] and is_gpu_error(e):
             print(f"GPU failed for {model_name}; retrying on CPU. {type(e).__name__}: {e}")
             cpu_est = make_xgb(False) if model_name == "XGBoost" else make_catboost(False)
-            cpu_pipe = Pipeline([("preprocess", pipe.named_steps["preprocess"]), ("model", cpu_est)])
+            inner = unwrap_pipeline(pipe)
+            cpu_pipe = maybe_log_wrap(Pipeline([("preprocess", inner.named_steps["preprocess"]), ("model", cpu_est)]))
             search = _make_search(cpu_pipe)
             search.fit(X, y, **fit_kwargs)
             return search, "CPU_fallback"
@@ -1045,7 +1101,7 @@ def oof_predict(estimator, X, y, splits, sample_weight=None):
         est = clone(estimator)
         fit_kwargs = {}
         if sample_weight is not None:
-            fit_kwargs["model__sample_weight"] = np.asarray(sample_weight)[tr]
+            fit_kwargs[sw_key()] = np.asarray(sample_weight)[tr]
         est.fit(X.iloc[tr], y.iloc[tr], **fit_kwargs)
         pred = est.predict(X.iloc[va])
         oof[va] = pred
@@ -1095,7 +1151,7 @@ def nested_cv(feature_set, model_name, X_dev, y_dev, numerical, categorical):
         inner = KFold(n_splits=NESTED_CV_INNER_SPLITS, shuffle=True, random_state=RANDOM_STATE + i)
         pipe = build_pipeline(clone(spec["estimator"]), numerical, categorical, scale=spec.get("scale", False))
         try:
-            search = RandomizedSearchCV(pipe, spec["params"], n_iter=n_iter, scoring="r2", cv=inner,
+            search = RandomizedSearchCV(pipe, log_param_grid(spec["params"]), n_iter=n_iter, scoring="r2", cv=inner,
                                         random_state=RANDOM_STATE, n_jobs=N_JOBS_SEARCH, error_score=np.nan)
             search.fit(Xtr, ytr)
             r2 = r2_score(yte, search.best_estimator_.predict(Xte))
@@ -1128,7 +1184,7 @@ def train_candidate(feature_set, model_name, model_spec, X_train, y_train, X_val
     oof, folds = oof_predict(best_est, X_train, y_train, cv_splits, sample_weight=weights)
 
     candidate_est = clone(best_est)
-    fit_kwargs = {"model__sample_weight": weights} if weights is not None else {}
+    fit_kwargs = {sw_key(): weights} if weights is not None else {}
     candidate_est.fit(X_train, y_train, **fit_kwargs)
 
     train_pred = candidate_est.predict(X_train)
@@ -1181,7 +1237,7 @@ def build_stacking(best_params_by_model: Dict[str, Dict[str, Any]], numerical, c
     """Build an OOF-safe stacking regressor from the tuned base models (RidgeCV meta)."""
     estimators = []
     for name, bp in best_params_by_model.items():
-        clean = {k.replace("model__", ""): v for k, v in bp.items()}
+        clean = {k.replace("regressor__model__", "").replace("model__", ""): v for k, v in bp.items()}
         if name == "XGBoost" and HAS_XGBOOST:
             base = make_xgb(USE_GPU)
         elif name == "LightGBM" and HAS_LIGHTGBM:
@@ -1204,13 +1260,16 @@ def build_stacking(best_params_by_model: Dict[str, Dict[str, Any]], numerical, c
             base.set_params(**clean)
         except Exception:
             pass
-        estimators.append((name, build_pipeline(base, numerical, categorical)))
+        # wrap=False: base learners stay RAW; the log transform is applied ONCE around the
+        # whole ensemble below (so we don't log-transform the target twice).
+        estimators.append((name, build_pipeline(base, numerical, categorical, wrap=False)))
     if len(estimators) < 2:
         return None
-    return StackingRegressor(
+    stack = StackingRegressor(
         estimators=estimators,
         final_estimator=RidgeCV(alphas=[0.1, 1.0, 10.0]),
         cv=CV_FOLDS, n_jobs=N_JOBS_SEARCH, passthrough=False)
+    return maybe_log_wrap(stack)
 
 
 # =============================================================================
@@ -1411,7 +1470,7 @@ def plot_feature_set_elbow(results_df, out_dir) -> List[Dict[str, Any]]:
 
 
 def transformed_matrix(estimator, X):
-    pre = estimator.named_steps.get("preprocess")
+    pre = unwrap_pipeline(estimator).named_steps.get("preprocess")
     X_t = pre.transform(X)
     try:
         names = list(pre.get_feature_names_out())
@@ -1455,7 +1514,7 @@ def plot_bias_variance(best_params, numerical, categorical, X_train, y_train, X_
     graphs = []
     if not RUN_BIAS_VARIANCE_CURVES or not HAS_XGBOOST:
         return graphs
-    bp = {str(k).replace("model__", ""): v for k, v in best_params.items()}
+    bp = {str(k).replace("regressor__model__", "").replace("model__", ""): v for k, v in best_params.items()}
     base = dict(objective="reg:squarederror", eval_metric="rmse", tree_method="hist",
                 random_state=RANDOM_STATE, n_jobs=N_JOBS_MODEL)
     if USE_GPU:
@@ -1537,7 +1596,7 @@ def run_shap(estimator, X_explain, pred_df, out_dir):
             rng = np.random.default_rng(RANDOM_STATE)
             idx_used = rng.choice(idx_used, size=MAX_SHAP_ROWS, replace=False)
             X_t = X_t[idx_used]
-        model = estimator.named_steps["model"]
+        model = unwrap_pipeline(estimator).named_steps["model"]
         explainer = shap.TreeExplainer(model)
         sv = explainer(X_t)
         mean_abs = np.abs(sv.values).mean(axis=0)
@@ -2109,6 +2168,8 @@ def main():
         {"Setting": "Nested CV", "Value": (f"{NESTED_CV_FEATURE_SET}|{NESTED_CV_MODEL}, outer {NESTED_CV_OUTER_SPLITS}x{NESTED_CV_OUTER_REPEATS}, inner {NESTED_CV_INNER_SPLITS}-fold" if RUN_NESTED_CV else "off")},
         {"Setting": "Forced final model", "Value": f"{FORCE_FINAL_FEATURE_SET} | {FORCE_FINAL_MODEL}" if FORCE_FINAL_FEATURE_SET else "auto robust-score"},
         {"Setting": "High-rut weighting", "Value": RUN_HIGH_RUT_WEIGHTING},
+        {"Setting": "Replicate averaging (Option B)", "Value": f"{AVERAGE_REPLICATES} (one averaged target row per {ID_COL}; removes replicate leakage)"},
+        {"Setting": "Log-target (Option B)", "Value": f"{LOG_TARGET} (train on log1p(target); metrics back on original scale)"},
         {"Setting": "Random state", "Value": RANDOM_STATE},
         {"Setting": "Train/Val/Test rows", "Value": f"{len(train_idx)}/{len(val_idx)}/{len(test_idx)}"},
         {"Setting": "Training CV", "Value": f"{CV_FOLDS}-fold target-bin StratifiedKFold inside 70% train"},
