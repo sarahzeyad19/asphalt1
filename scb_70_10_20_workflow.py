@@ -243,8 +243,12 @@ NESTED_CV_OUTER_REPEATS = 2     # 5x2 = 10 unbiased outer scores (raise to 3 for
 NESTED_CV_INNER_SPLITS = 4
 NESTED_CV_INNER_NITER = 30
 
-# GPU options. Default OFF (this machine has no usable CUDA driver -> avoids CatBoost errors).
-USE_GPU = False
+# GPU options. USE_GPU=True runs XGBoost (device="cuda") and CatBoost (task_type="GPU") on the
+# GPU. Requires an NVIDIA GPU with CUDA drivers. If the GPU isn't usable, GPU_FALLBACK_TO_CPU
+# automatically retries that model on CPU (no crash). LightGBM stays on CPU because the standard
+# pip wheel is not built with GPU support; set USE_LIGHTGBM_GPU=True only if you installed a
+# GPU-enabled LightGBM build yourself.
+USE_GPU = True
 GPU_DEVICE = "0"
 GPU_FALLBACK_TO_CPU = True
 USE_LIGHTGBM_GPU = False
