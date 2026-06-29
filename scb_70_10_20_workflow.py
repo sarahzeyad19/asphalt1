@@ -965,8 +965,8 @@ def define_models(feature_set: str) -> Dict[str, Dict[str, Any]]:
                 "model__subsample": [0.60, 0.70, 0.80],
                 "model__colsample_bytree": [0.50, 0.70, 0.90],
                 "model__gamma": [0.0, 0.05, 0.10],
-                "model__reg_alpha": [0.0, 0.3, 1.0, 2.0],
-                "model__reg_lambda": [0.1, 0.5, 2.0, 5.0, 10.0],
+                "model__reg_alpha": [0.0, 0.5, 1.0, 2.0],
+                "model__reg_lambda": [0.5, 1.0, 5.0, 10.0, 20.0],
                 "model__max_bin": [128, 256],
             },
         }
