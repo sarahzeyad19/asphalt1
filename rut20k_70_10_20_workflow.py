@@ -207,7 +207,8 @@ N_JOBS_MODEL = -1
 # Repeated-CV robustness (advisor "repeated CV"). Set REPEATS lower to save time.
 RUN_REPEATED_CV = True
 REPEATED_CV_REPEATS = 5          # 5 folds x 5 repeats = 25 dev scores
-REPEATED_CV_TOP_K = 3            # only re-evaluate the top-K finalists this way
+REPEATED_CV_TOP_K = 3            # legacy: retained for reference; RepeatedCV now runs the best
+                                 # instance of EVERY model family + the stacking ensemble
 
 # Ensemble.
 RUN_STACKING = True
@@ -889,7 +890,9 @@ def define_models(feature_set: str) -> Dict[str, Dict[str, Any]]:
             },
         }
 
-    # ---- Additional HIGH-ROBUSTNESS models (bagging, robust/penalized linear, SVR, EBM) ----
+    # ---- Additional TREE / BAGGING models (linear ElasticNet/Huber, SVR, EBM REMOVED:
+    #      they added no value — ElasticNet/Huber R2~0.14 on this non-linear target, SVR
+    #      unstable and slow, EBM below the boosters. Keeping a tree-only robust lineup.) ----
     rbr_or_shap = ["VolumetricsB_NoADT_RBR_Both", "SHAP12_RBR"]
     if feature_set in rbr_or_shap:
         # Extremely randomized trees: lowest-variance, hardest-to-overfit tree model.
@@ -901,15 +904,6 @@ def define_models(feature_set: str) -> Dict[str, Dict[str, Any]]:
                 "model__max_depth": [None, 8, 16],
                 "model__min_samples_leaf": [1, 5, 10, 20],
                 "model__max_features": ["sqrt", 0.5, 0.8],
-            },
-        }
-        # Penalized linear model: near-zero overfit risk, robust baseline.
-        models["ElasticNet"] = {
-            "estimator": ElasticNet(max_iter=10000, random_state=RANDOM_STATE),
-            "n_iter": N_ITER_OTHER, "scale": True,
-            "params": {
-                "model__alpha": [0.001, 0.01, 0.05, 0.1, 0.5, 1.0],
-                "model__l1_ratio": [0.1, 0.3, 0.5, 0.7, 0.9],
             },
         }
     if feature_set == "VolumetricsB_NoADT_RBR_Both":
@@ -935,36 +929,6 @@ def define_models(feature_set: str) -> Dict[str, Dict[str, Any]]:
                 "model__min_samples_leaf": [10, 20],
             },
         }
-    if feature_set == "SHAP12_RBR":
-        # Robust linear regression (outlier-resistant) and RBF SVR for small noisy data.
-        models["HuberRegressor"] = {
-            "estimator": HuberRegressor(max_iter=2000),
-            "n_iter": N_ITER_OTHER, "scale": True,
-            "params": {
-                "model__epsilon": [1.1, 1.35, 1.5, 2.0],
-                "model__alpha": [1e-4, 1e-3, 1e-2, 1e-1],
-            },
-        }
-        models["SVR_RBF"] = {
-            "estimator": SVR(kernel="rbf"),
-            "n_iter": N_ITER_OTHER, "scale": True,
-            "params": {
-                "model__C": [1, 10, 50, 100],
-                "model__gamma": ["scale", 0.01, 0.05, 0.1],
-                "model__epsilon": [0.1, 0.3, 0.5],
-            },
-        }
-        if HAS_EBM:
-            # Explainable Boosting Machine: glass-box GAM, robust + fully interpretable.
-            models["EBM"] = {
-                "estimator": ExplainableBoostingRegressor(random_state=RANDOM_STATE),
-                "n_iter": min(N_ITER_OTHER, 8), "scale": False,
-                "params": {
-                    "model__interactions": [0, 5, 10],
-                    "model__learning_rate": [0.01, 0.02],
-                    "model__max_bins": [128, 256],
-                },
-            }
 
     return {k: v for k, v in models.items() if v["estimator"] is not None}
 
@@ -1818,25 +1782,60 @@ def main():
     graph_rows += plot_model_comparison(results_df, PATHS["figures"] / "feature_sets")
     graph_rows += plot_feature_set_elbow(results_df, PATHS["figures"] / "feature_sets")
 
-    # ---- Repeated-CV robustness for top-K finalists (dev set only) ----
+    # ---- Repeated-CV robustness: best instance of EVERY model family + the ensemble ----
+    # Honest CV hierarchy: Validation R2 + OOF R2 (all candidates) -> RepeatedCV (one
+    # finalist per family, here) -> Nested CV (single interpretable model, below).
+    # We evaluate the best (top robust-score) instance of each model family so the leaderboard
+    # compares boosters, bagging models AND the stacking ensemble on the SAME 25-fold protocol.
     robust_rows = []
     if RUN_REPEATED_CV:
-        print("\nRepeated-CV robustness on top finalists (80% dev set, no test leakage)...")
-        for label in list(results_df["Label"].head(REPEATED_CV_TOP_K)):
+        print("\nRepeated-CV robustness: best instance per model family + ensemble (80% dev set, no test leakage)...")
+        core_families = ["XGBoost", "LightGBM", "CatBoost", "RandomForest", "ExtraTrees",
+                         "HistGradientBoosting", "GradientBoostingHuber", "StackingRegressor"]
+        # Labels to evaluate: best-scoring instance of each family present, plus the forced final model.
+        cv_labels = []
+        for fam in core_families:
+            fam_rows = results_df[results_df["Model"] == fam]
+            if not fam_rows.empty:
+                cv_labels.append(fam_rows.iloc[0]["Label"])  # results_df is sorted by Robust_Selection_Score
+        if FORCE_FINAL_FEATURE_SET and FORCE_FINAL_MODEL:
+            forced = f"{FORCE_FINAL_FEATURE_SET} | {FORCE_FINAL_MODEL}"
+            if forced in set(results_df["Label"]) and forced not in cv_labels:
+                cv_labels.append(forced)
+        # de-dup, preserve order
+        seen = set()
+        cv_labels = [l for l in cv_labels if not (l in seen or seen.add(l))]
+        for label in cv_labels:
             obj = trained_objects.get(label)
             if obj is None:
                 continue
+            meta = results_df[results_df["Label"] == label].iloc[0]
             try:
                 X_dev = pd.concat([obj["X_train"], obj["X_val"]], axis=0).reset_index(drop=True)
                 y_dev = pd.concat([obj["y_train"], obj["y_val"]], axis=0).reset_index(drop=True)
                 rc = repeated_cv_robust(obj["best_estimator"], X_dev, y_dev)
-                rc.update({"Label": label})
+                rc.update({"Label": label, "Model": meta["Model"], "Feature_Set": meta["Feature_Set"],
+                           "Validation_R2": meta.get("Validation_R2", np.nan),
+                           "TrainOOF_R2": meta.get("TrainOOF_R2", np.nan)})
                 robust_rows.append(rc)
                 print(f"  {label}: RepeatedCV R2={rc['RepeatedCV_Mean_R2']:.4f} +/- {rc['RepeatedCV_SD_R2']:.4f} "
                       f"(min {rc['RepeatedCV_Min_R2']:.4f}, n={rc['RepeatedCV_N']})")
             except Exception as e:
                 print(f"  Repeated CV failed for {label}: {type(e).__name__}: {e}")
     robust_df = pd.DataFrame(robust_rows)
+
+    # ---- Honest CV leaderboard (RepeatedCV is the fair, split-robust ranking) ----
+    honest_cv_df = pd.DataFrame()
+    if not robust_df.empty:
+        cols = ["Model", "Feature_Set", "Label", "RepeatedCV_Mean_R2", "RepeatedCV_SD_R2",
+                "RepeatedCV_Min_R2", "Validation_R2", "TrainOOF_R2", "RepeatedCV_N"]
+        cols = [c for c in cols if c in robust_df.columns]
+        honest_cv_df = robust_df[cols].sort_values("RepeatedCV_Mean_R2", ascending=False).reset_index(drop=True)
+        honest_cv_df.insert(0, "Rank", range(1, len(honest_cv_df) + 1))
+        print("\nHonest CV leaderboard (ranked by RepeatedCV mean R2, 25 dev folds):")
+        for _, r in honest_cv_df.iterrows():
+            print(f"  {int(r['Rank'])}. {r['Model']:<22} {r['RepeatedCV_Mean_R2']:.4f} "
+                  f"+/- {r['RepeatedCV_SD_R2']:.4f} (min {r['RepeatedCV_Min_R2']:.4f})")
 
     # ---- Nested CV (unbiased robustness; dev set only, no test leakage) ----
     nested_folds_df, nested_summary_df = pd.DataFrame(), pd.DataFrame()
@@ -2033,7 +2032,7 @@ def main():
         {"Setting": "Random state", "Value": RANDOM_STATE},
         {"Setting": "Train/Val/Test rows", "Value": f"{len(train_idx)}/{len(val_idx)}/{len(test_idx)}"},
         {"Setting": "Training CV", "Value": f"{CV_FOLDS}-fold target-bin StratifiedKFold inside 70% train"},
-        {"Setting": "Repeated CV", "Value": f"{CV_FOLDS}x{REPEATED_CV_REPEATS} on 80% dev for top-{REPEATED_CV_TOP_K}"},
+        {"Setting": "Repeated CV", "Value": f"{CV_FOLDS}x{REPEATED_CV_REPEATS} on 80% dev for best instance per model family + ensemble"},
         {"Setting": "N_ITER_XGB", "Value": N_ITER_XGB},
         {"Setting": "GPU status", "Value": gpu_status_string()},
         {"Setting": "True RBR", "Value": "RBR_JMF_fraction (=RBR_decimal), RBR_JMF_percent (=RBR_percent)"},
@@ -2089,6 +2088,8 @@ def main():
         feature_sets_df.to_excel(writer, sheet_name="Feature_Sets", index=False)
         results_df.to_excel(writer, sheet_name="Candidate_Results", index=False)
         decision_df.to_excel(writer, sheet_name="Decision_Table", index=False)
+        if not honest_cv_df.empty:
+            honest_cv_df.to_excel(writer, sheet_name="Honest_CV_Leaderboard", index=False)
         if not robust_df.empty:
             robust_df.to_excel(writer, sheet_name="RepeatedCV_Robustness", index=False)
         if not nested_summary_df.empty:
