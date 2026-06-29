@@ -278,7 +278,8 @@ QUICK_SMOKE_TEST = False
 
 # ---- Input file resolution ----
 HOME = Path.home()
-DOWNLOADS = HOME / "Downloads"
+# Input data + outputs live here. Change this one line if your Downloads folder moves.
+DOWNLOADS = Path(r"C:\Users\H0012066\Downloads")
 RUT_FILENAME = "SCB_Cleaned_with_RBR.xlsx"
 RUT_FILE = DOWNLOADS / RUT_FILENAME
 RUT_FILE_FALLBACKS = [
