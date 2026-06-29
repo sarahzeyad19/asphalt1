@@ -22,6 +22,16 @@ history in `Rut_20k_Model_Runs_and_Split_Comparison.docx`.
 | **Statistical + feature-importance analysis** | `statistical_analysis()`: descriptive stats, correlation heatmap, correlation-with-target, **VIF multicollinearity**; plus permutation importance and SHAP importance. |
 | **SHAP + sensitivity over RBR ranges; find where the model is weak** | `shap_by_rbr_band()`, `error_by_group()` by `RBR_band` and by rut range, **applicability-domain** flag for sparse extreme regions, and an auto **Model_Weakness_Map**. |
 | **Use SHAP + advisor comments to pick the most impactful variables** | Feature sets are seeded from the SHAP ranking (PG_HighTemp, RBR, SandEq, Absorption, VFA, …) and the advisor's recommended physical interactions. |
+| **Latency + throughput (real-time serving metrics)** | `inference_performance()` measures single-row latency (median + p95), batch throughput (rows/sec), per-row batch latency, and on-disk model size on the **validation** sample (never the locked test) → **`Realtime_Latency_Throughput`** sheet. |
+
+### Meeting the standard evaluation criteria
+
+| Criterion (textbook / supervisor) | How this workflow satisfies it |
+|---|---|
+| **Three-way data split** — train fits the model, validation tunes hyper-parameters & selects the model, test is reserved for one final unbiased evaluation; typical 70–80 / 10–15 / 10–15 | Two scripts: **70/10/20** and **65/15/20** (both inside the recommended ranges). Train = model fitting; **validation** = held-out comparison that drives model selection, while hyper-parameters are tuned by `RandomizedSearchCV` 5-fold CV *inside the training data*; the **20% test is locked** behind `SCORE_LOCKED_TEST` and untouched until a single final evaluation. |
+| **Latency & throughput in metrics** (real-time use) | `inference_performance()` reports prediction **latency** (delay per input, median + p95 tail) and **throughput** (predictions/sec), plus model size, in the `Realtime_Latency_Throughput` sheet — so the model is judged on speed, not only accuracy. |
+| **Test set represents the real environment** | The split is **target-bin stratified** (`random_state=42`), so the locked test mirrors the full rut/SCB distribution rather than a skewed slice. |
+| **Optimization steps when accuracy/speed fall short** | *Feature engineering*: 9 feature sets incl. physical interactions & true RBR. *Preprocessing*: median imputation + one-hot in a leakage-safe `Pipeline`. *Architecture/technique*: high regularization, Huber loss, RepeatedCV per family, stacking ensemble. *Compression/efficiency*: shallow trees + the model-size metric give a direct quantization/compression lever. |
 
 ---
 

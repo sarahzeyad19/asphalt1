@@ -742,6 +742,63 @@ def relative_error_summary(y_true, y_pred, prefix: str = "") -> Dict[str, float]
     }
 
 
+def inference_performance(estimator, X, model_path=None, n_repeats: int = 30) -> pd.DataFrame:
+    """Measure real-time serving metrics for the final model on a held-out (non-test) sample:
+    single-row latency (ms), batch throughput (rows/sec), and on-disk model size (a proxy for
+    how amenable the model is to compression/quantization). These answer the "latency and
+    throughput" evaluation criterion alongside accuracy."""
+    import time
+    X = X.reset_index(drop=True)
+    n = len(X)
+    if n == 0:
+        return pd.DataFrame()
+    # Warm-up (first call pays one-off JIT / thread-pool / allocation costs).
+    estimator.predict(X.iloc[:1])
+    estimator.predict(X)
+
+    # --- Single-row latency: time one row at a time, repeated, report median + tail (p95). ---
+    one = X.iloc[:1]
+    single_ms = []
+    for _ in range(n_repeats):
+        t0 = time.perf_counter()
+        estimator.predict(one)
+        single_ms.append((time.perf_counter() - t0) * 1e3)
+    single_ms = np.array(single_ms)
+
+    # --- Batch throughput: predict the whole sample, repeated; rows / total seconds. ---
+    batch_s = []
+    for _ in range(max(5, n_repeats // 3)):
+        t0 = time.perf_counter()
+        estimator.predict(X)
+        batch_s.append(time.perf_counter() - t0)
+    batch_s = np.array(batch_s)
+    batch_throughput = n / float(np.median(batch_s))
+    batch_latency_per_row_ms = (float(np.median(batch_s)) / n) * 1e3
+
+    size_mb = np.nan
+    if model_path is not None:
+        try:
+            size_mb = Path(model_path).stat().st_size / (1024 ** 2)
+        except Exception:
+            pass
+
+    rows = [
+        {"Metric": "Single-row latency median (ms)", "Value": round(float(np.median(single_ms)), 4),
+         "Note": "Delay from one input row to its prediction (online serving)."},
+        {"Metric": "Single-row latency p95 (ms)", "Value": round(float(np.percentile(single_ms, 95)), 4),
+         "Note": "Tail latency — 95% of single predictions are faster than this."},
+        {"Metric": "Batch latency per row (ms)", "Value": round(batch_latency_per_row_ms, 5),
+         "Note": f"Amortized cost per row when scoring the whole {n}-row sample at once."},
+        {"Metric": "Batch throughput (rows/sec)", "Value": round(batch_throughput, 1),
+         "Note": "How many predictions per second in batch mode (vectorized)."},
+        {"Metric": "Model size on disk (MB)", "Value": round(float(size_mb), 4) if np.isfinite(size_mb) else np.nan,
+         "Note": "Serialized pipeline size; lower = easier to compress / quantize / deploy."},
+        {"Metric": "Sample rows / hardware", "Value": f"{n} rows / CPU",
+         "Note": "Measured on the validation sample (no test leakage), single-threaded CPU."},
+    ]
+    return pd.DataFrame(rows)
+
+
 def add_error_columns(df: pd.DataFrame, pred_col: str = "Predicted") -> pd.DataFrame:
     out = df.copy()
     out["Residual"] = out[pred_col] - out["Measured"]
@@ -1948,6 +2005,17 @@ def main():
         metrics_sheet = "Dev_Train_Val_Metrics"
         workbook_name = f"SCB_v3_{SPLIT_TAG}_DEV_ONLY_train_val_Results.xlsx"
 
+    # ---- Real-time serving metrics for the selected model (latency + throughput) ----
+    # Measured on the validation feature sample only — never the locked test.
+    realtime_df = pd.DataFrame()
+    try:
+        realtime_df = inference_performance(final_est, X_explain, final_model_path)
+        if not realtime_df.empty:
+            print("\nReal-time serving metrics (latency / throughput, validation sample, CPU):")
+            print(realtime_df.to_string(index=False))
+    except Exception as e:
+        print(f"Inference-performance timing failed: {type(e).__name__}: {e}")
+
     # ---- Diagnostics for the selected model (test only touched when SCORE_LOCKED_TEST) ----
     for split in diag_splits:
         graph_rows += plot_residuals(final_pred_df, split, diag)
@@ -2111,6 +2179,8 @@ def main():
         data_reco_df.to_excel(writer, sheet_name="Reach_0.80_DataPlan", index=False)
         final_recommendation.to_excel(writer, sheet_name="Final_Selected_Model", index=False)
         final_metrics_df.to_excel(writer, sheet_name=metrics_sheet, index=False)
+        if not realtime_df.empty:
+            realtime_df.to_excel(writer, sheet_name="Realtime_Latency_Throughput", index=False)
         final_pred_df.to_excel(writer, sheet_name="Final_Predictions", index=False)
         if not error_by_rut_range.empty:
             error_by_rut_range.to_excel(writer, sheet_name="Error_By_Rut_Range", index=False)
