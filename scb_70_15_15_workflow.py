@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-RUT_20K MODELING WORKFLOW v2 — 70/10/20 LOCKED TEST + TRUE RBR + HIGH REGULARIZATION
+SCB MODELING WORKFLOW v2 — 70/10/20 LOCKED TEST + TRUE RBR + HIGH REGULARIZATION
                                + STACKING + REPEATED-CV ROBUSTNESS + FULL DIAGNOSTICS
                                + RBR-RANGE SENSITIVITY + APPLICABILITY DOMAIN
 Author: Updated for Sarah Al-Jezawi
@@ -178,13 +178,14 @@ except Exception:
 # =============================================================================
 
 RANDOM_STATE = 42
-TARGET = "Rut_20k"
+TARGET = "SCB"
+TARGET_UNITS = ""   # SCB is unitless (mm for rutting); used in plot axis labels
 ID_COL = "MixDesignKey"
 
 # ---- DATA SPLIT (only thing that differs between the two delivered scripts) ----
 TRAIN_SIZE = 0.70
-VALIDATION_SIZE = 0.10
-TEST_SIZE = 0.20
+VALIDATION_SIZE = 0.15
+TEST_SIZE = 0.15
 # Development data = train + validation. Locked test is held out.
 SPLIT_TAG = f"{int(TRAIN_SIZE*100)}_{int(VALIDATION_SIZE*100)}_{int(TEST_SIZE*100)}"
 
@@ -208,13 +209,12 @@ N_JOBS_MODEL = -1
 
 # ---- Leakage control: keep every replicate of a mix in the SAME split AND the SAME CV fold ----
 # When True, MixDesignKey (ID_COL) is used as a GROUP so the same physical mix can never appear
-# in train and test (or in train and validation, or across CV folds). This is the rigorous,
-# no-leakage protocol — train/val/test split, the inner training CV, RepeatedCV and Nested CV all
-# become group-aware (StratifiedGroupKFold). Honest note: removing this leakage usually LOWERS the
-# reported R2 slightly (the previous number was mildly inflated), but it is the correct estimate.
+# in train and test (or across CV folds). Split, training CV, RepeatedCV and Nested CV all become
+# group-aware (StratifiedGroupKFold). Removing this leakage usually LOWERS the reported R2 slightly
+# but it is the correct, defensible estimate.
 GROUP_SPLIT_BY_MIX = True
 GROUP_COL = ID_COL
-_GROUPS_FULL = None  # set in main() from df[GROUP_COL]; None disables grouping at runtime
+_GROUPS_FULL = None
 
 # Repeated-CV robustness (advisor "repeated CV"). Set REPEATS lower to save time.
 RUN_REPEATED_CV = True
@@ -232,15 +232,13 @@ RUN_HIGH_RUT_WEIGHTING = False
 # AVERAGE_REPLICATES: the same mix (MixDesignKey) is tested several times with different
 #   measured values (measurement noise). Collapsing each mix to ONE row with the AVERAGED
 #   target gives a cleaner, more stable target -> usually higher R2 + smaller train/val gap.
-#   It also removes the replicate leakage (after averaging, every mix is one unique row, so
-#   no mix can appear in both train and test), which makes a group split unnecessary.
-# LOG_TARGET: train on log1p(target). The target is right-skewed (many low values, few very
-#   high ones); the model "compresses" the high tail (best-fit slope < 1). Modelling in log
-#   space symmetrises the target -> better high-value behaviour and a smaller gap. All metrics,
-#   best-fit lines, residuals and plots are reported back on the ORIGINAL scale.
+#   It also removes replicate leakage (after averaging every mix is one unique row).
+# LOG_TARGET: train on log1p(target). The target is right-skewed; modelling in log space
+#   symmetrises it and reduces the high-value compression. All metrics/plots are reported
+#   back on the ORIGINAL scale.
 AVERAGE_REPLICATES = False
-LOG_TARGET = False  # raw target. (Log lowered rutting numbers — the target isn't skewed enough
-                    # to benefit. Set True only for a strongly right-skewed target like SCB.)
+LOG_TARGET = False  # raw target (known-good baseline). SCB's target is the more right-skewed one,
+                    # so log MIGHT help here — try LOG_TARGET=True and compare if you want.
 
 # ---- FORCE the final interpretable model (so SHAP/PDP run on a single tree model) ----
 # The Stacking ensemble cannot be SHAP-explained, so we lock the headline model to a single
@@ -303,7 +301,7 @@ RUN_SHAP = True
 RUN_PDP = True
 RUN_LEARNING_CURVE = True
 RUN_BIAS_VARIANCE_CURVES = True
-RUN_ROC_RISK_SCREENING = True
+RUN_ROC_RISK_SCREENING = False
 RUT_RISK_THRESHOLD_MM = 6.0
 MAX_SHAP_ROWS = 700
 MAX_PDP_FEATURES = 8
@@ -316,16 +314,16 @@ QUICK_SMOKE_TEST = False
 HOME = Path.home()
 # Input data + outputs live here. Change this one line if your Downloads folder moves.
 DOWNLOADS = Path(r"C:\Users\H0012066\Downloads")
-RUT_FILENAME = "Rutting_Cleaned_with_RBR.xlsx"
+RUT_FILENAME = "SCB_Cleaned_with_RBR.xlsx"
 RUT_FILE = DOWNLOADS / RUT_FILENAME
 RUT_FILE_FALLBACKS = [
-    DOWNLOADS / "725e0ea2-Rutting_Cleaned_with_RBR.xlsx",
-    DOWNLOADS / "Rutting_Cleaned_with_RBR (1).xlsx",
-    DOWNLOADS / "Rutting_Cleaned_SpecBased.xlsx",
+    DOWNLOADS / "725e0ea2-SCB_Cleaned_with_RBR.xlsx",
+    DOWNLOADS / "SCB_Cleaned_with_RBR (1).xlsx",
+    DOWNLOADS / "SCB_Cleaned.xlsx",
 ]
 SHEET_CANDIDATES = ["Cleaned_With_RBR", "Cleaned_Dataset", "Cleaned_Data_Kept", "Sheet1", 0]
 
-OUTPUT_FOLDER = DOWNLOADS / f"Rut20k_v3_{SPLIT_TAG}_RBR_outputs"
+OUTPUT_FOLDER = DOWNLOADS / f"SCB_v3_{SPLIT_TAG}_RBR_outputs"
 
 if QUICK_SMOKE_TEST:
     N_ITER_XGB = 8
@@ -413,11 +411,11 @@ def resolve_file_path(path: Path, fallbacks: List[Path]) -> Path:
     try:
         script_dir = Path(__file__).resolve().parent
         candidates += [script_dir / p.name for p in list(candidates)]
-        candidates += list(script_dir.glob("*Rutting_Cleaned_with_RBR*.xlsx"))
+        candidates += list(script_dir.glob("*SCB_Cleaned_with_RBR*.xlsx"))
     except Exception:
         pass
     candidates += [Path.cwd() / p.name for p in list(candidates)]
-    candidates += list(Path.cwd().glob("*Rutting_Cleaned_with_RBR*.xlsx"))
+    candidates += list(Path.cwd().glob("*SCB_Cleaned_with_RBR*.xlsx"))
     seen, out = set(), []
     for p in candidates:
         if str(p) in seen:
@@ -426,7 +424,7 @@ def resolve_file_path(path: Path, fallbacks: List[Path]) -> Path:
         if p.exists():
             return p
     raise FileNotFoundError(
-        "Could not find the Rutting Excel file. Put 'Rutting_Cleaned_with_RBR.xlsx' in your "
+        "Could not find the Rutting Excel file. Put 'SCB_Cleaned_with_RBR.xlsx' in your "
         "Downloads folder or next to this script. Tried:\n" + "\n".join(str(p) for p in candidates[:12])
     )
 
@@ -648,13 +646,9 @@ def load_data() -> Tuple[pd.DataFrame, pd.Series, Path]:
     df = create_engineered_columns(df)
     if TARGET not in df.columns:
         raise KeyError(f"Target {TARGET!r} not found. Columns: {list(df.columns)[:30]}")
-    # Drop rows with no target BEFORE averaging.
     df = df.loc[pd.to_numeric(df[TARGET], errors="coerce").notna()].reset_index(drop=True)
 
     # ---- Option B: collapse replicate tests of the same mix into one averaged row ----
-    # Each MixDesignKey may be tested multiple times; numeric columns (incl. the target) are
-    # averaged, text columns take the first value. This denoises the target and guarantees one
-    # unique mix per row (so the train/val/test split cannot leak the same mix across folds).
     if AVERAGE_REPLICATES and ID_COL in df.columns:
         before = len(df)
         agg = {}
@@ -670,12 +664,14 @@ def load_data() -> Tuple[pd.DataFrame, pd.Series, Path]:
     mask = y.notna()
     df = df.loc[mask].reset_index(drop=True)
     y = y.loc[mask].reset_index(drop=True)
+    global _RANGE_CUTS
+    _RANGE_CUTS = (float(np.nanquantile(y, 1 / 3)), float(np.nanquantile(y, 2 / 3)))
     print("\n" + "=" * 100)
     print(f"Loaded {TARGET} data")
     print("=" * 100)
+    print(f"Replicate averaging: {AVERAGE_REPLICATES} | Log-target: {LOG_TARGET}")
     print(f"File: {path}")
     print(f"Rows: {len(df)} | Columns after engineering: {df.shape[1]}")
-    print(f"Replicate averaging: {AVERAGE_REPLICATES} | Log-target: {LOG_TARGET}")
     has_rbr = "RBR_JMF_fraction" in df.columns
     print(f"True RBR present: {has_rbr}"
           + (f" | RBR_percent mean={df['RBR_JMF_percent'].mean():.2f}" if "RBR_JMF_percent" in df.columns else ""))
@@ -697,8 +693,7 @@ def make_target_bins(y: pd.Series, n_bins: int = N_TARGET_BINS) -> pd.Series:
 
 
 def _first_fold_holdout(bins, groups, holdout_size, seed):
-    """Return (keep_idx, holdout_idx) where the holdout is ~holdout_size of the data, target-
-    stratified, and GROUP-safe (no group spans the two sides) when groups is not None."""
+    """Return (keep_idx, holdout_idx); holdout ~holdout_size, target-stratified, GROUP-safe."""
     n = len(bins)
     n_splits = max(2, int(round(1.0 / holdout_size)))
     if groups is not None:
@@ -711,18 +706,13 @@ def _first_fold_holdout(bins, groups, holdout_size, seed):
 
 
 def stratified_70_10_20_split(df: pd.DataFrame, y: pd.Series):
-    """Two-stage split. Hold out the locked test FIRST, then carve dev into train + validation.
-    When GROUP_SPLIT_BY_MIX, the split is GROUP-aware (StratifiedGroupKFold on MixDesignKey) so
-    no physical mix appears in more than one split — eliminating replicate leakage."""
+    """Two-stage split, GROUP-aware on MixDesignKey when GROUP_SPLIT_BY_MIX so no physical mix
+    appears in more than one split (eliminates replicate leakage)."""
     bins = make_target_bins(y)
     groups = None
     if GROUP_SPLIT_BY_MIX and GROUP_COL in df.columns:
         groups = df[GROUP_COL].astype(str).values
-
-    # Stage 1: peel off the locked test (group-safe, stratified).
     dev_idx, test_idx = _first_fold_holdout(bins, groups, TEST_SIZE, RANDOM_STATE)
-
-    # Stage 2: split dev into train + validation.
     dev_bins = bins.iloc[dev_idx].reset_index(drop=True)
     dev_groups = groups[dev_idx] if groups is not None else None
     val_fraction_of_dev = VALIDATION_SIZE / (TRAIN_SIZE + VALIDATION_SIZE)
@@ -922,14 +912,20 @@ def robust_score(validation_r2, oof_r2, gap, fold_sd, n_features) -> float:
                  - 0.20 * fold_sd - 0.002 * n_features)
 
 
+# SCB has no fixed engineering bands (unlike rutting's mm thresholds), so error-by-range uses
+# tertiles of the SCB distribution, set once from the data in load_data().
+_RANGE_CUTS = None  # (q33, q66)
+
+
 def rut_range_label(y: float) -> str:
-    if y < 2:
-        return "Low <2 mm"
-    if y < 5:
-        return "Medium 2-5 mm"
-    if y < 7:
-        return "High 5-7 mm"
-    return "Very high >7 mm"
+    if _RANGE_CUTS is None or not np.isfinite(y):
+        return "all"
+    lo, hi = _RANGE_CUTS
+    if y < lo:
+        return f"Low (<{lo:.3g})"
+    if y < hi:
+        return f"Medium ({lo:.3g}-{hi:.3g})"
+    return f"High (>{hi:.3g})"
 
 
 def error_by_group(pred_df: pd.DataFrame, group_col: str, label: str) -> pd.DataFrame:
@@ -980,23 +976,23 @@ def define_models(feature_set: str) -> Dict[str, Dict[str, Any]]:
     """High-regularization, shallow-tree grids per the advisor plan."""
     models: Dict[str, Dict[str, Any]] = {}
     if HAS_XGBOOST:
-        # Stronger regularization to shrink the train-validation gap (low LR + more trees,
-        # shallow depth, large min_child_weight, high L1/L2, gamma, aggressive subsampling).
-        # NOTE: tuned for the RAW target scale; if you set LOG_TARGET=True, lower reg_lambda/
-        # reg_alpha/gamma (the log target is ~10x smaller in scale).
+        # Regularization grid SCALED for SCB's small target range (~0.46-1.45). The rutting
+        # script uses much higher reg_lambda (30-120); on SCB that L2 swamps the tiny leaf
+        # gradients and XGBoost collapses to predicting the mean, so here lambda/alpha are
+        # smaller, learning rate a bit higher, and min_child_weight lower.
         models["XGBoost"] = {
             "estimator": make_xgb(USE_GPU),
             "n_iter": N_ITER_XGB,
             "params": {
-                "model__n_estimators": [600, 900, 1200],
-                "model__learning_rate": [0.01, 0.015, 0.02],
+                "model__n_estimators": [400, 600, 900],
+                "model__learning_rate": [0.02, 0.03, 0.05],
                 "model__max_depth": [2, 3],
-                "model__min_child_weight": [15, 20, 30, 40],
+                "model__min_child_weight": [3, 5, 10, 15],
                 "model__subsample": [0.60, 0.70, 0.80],
-                "model__colsample_bytree": [0.50, 0.60, 0.70],
-                "model__gamma": [0.10, 0.20, 0.30],
-                "model__reg_alpha": [1.0, 2.0, 4.0, 8.0],
-                "model__reg_lambda": [30, 50, 80, 120],
+                "model__colsample_bytree": [0.50, 0.70, 0.90],
+                "model__gamma": [0.0, 0.05, 0.10],
+                "model__reg_alpha": [0.0, 0.5, 1.0, 2.0],
+                "model__reg_lambda": [0.5, 1.0, 5.0, 10.0, 20.0],
                 "model__max_bin": [128, 256],
             },
         }
@@ -1081,11 +1077,8 @@ def define_models(feature_set: str) -> Dict[str, Dict[str, Any]]:
     return {k: v for k, v in models.items() if v["estimator"] is not None}
 
 
-# ---- Log-target helpers (Option B). When LOG_TARGET, the whole pipeline is wrapped in a
-#      TransformedTargetRegressor so it TRAINS on log1p(y) but PREDICTS on the original scale.
-#      That keeps every downstream metric/plot in original units with no other code changes,
-#      except: (a) RandomizedSearch param keys gain a "regressor__" prefix, and (b) SHAP must
-#      unwrap the inner pipeline to reach the tree model. ----
+# ---- Log-target helpers (Option B): wrap the pipeline in a TransformedTargetRegressor so it
+#      TRAINS on log1p(y) but PREDICTS on the original scale (metrics/plots unchanged). ----
 
 def maybe_log_wrap(estimator):
     if LOG_TARGET:
@@ -1112,7 +1105,6 @@ def unwrap_pipeline(est):
 
 
 def build_pipeline(estimator, numerical, categorical, scale: bool = False, wrap: bool = True) -> Pipeline:
-    # scale=True inserts StandardScaler after preprocessing for distance/penalty-based models.
     # wrap=False keeps a RAW pipeline (used for stacking base learners, so the log wrap is
     # applied ONCE around the whole ensemble instead of around every base learner).
     steps = [("preprocess", build_preprocessor(numerical, categorical))]
@@ -1180,8 +1172,7 @@ def rut_sample_weights(y) -> np.ndarray:
 
 
 def repeated_cv_robust(estimator, X, y, repeats=REPEATED_CV_REPEATS, groups=None) -> Dict[str, float]:
-    """Repeated CV on the dev set for a stable generalization estimate (no test leakage).
-    Group-aware (StratifiedGroupKFold on mix) when grouping is on, so no mix spans a fold."""
+    """Repeated CV on the dev set; group-aware (StratifiedGroupKFold on mix) when grouping is on."""
     bins = make_target_bins(y)
     scores = []
     for r in range(repeats):
@@ -1201,10 +1192,8 @@ def repeated_cv_robust(estimator, X, y, repeats=REPEATED_CV_REPEATS, groups=None
 
 
 def nested_cv(feature_set, model_name, X_dev, y_dev, numerical, categorical, groups=None):
-    """Proper nested CV on the dev set: outer folds for an UNBIASED generalization estimate,
-    inner RandomizedSearchCV for tuning inside each outer fold. Fully leakage-safe — all
-    preprocessing/tuning happens inside the Pipeline inside each fold, and when grouping is on
-    both the outer and inner folds are StratifiedGroupKFold so no mix crosses a fold boundary."""
+    """Proper, leakage-safe nested CV: preprocessing+tuning inside the Pipeline inside each fold;
+    outer and inner folds are StratifiedGroupKFold (no mix crosses a boundary) when grouping is on."""
     spec = define_models(feature_set).get(model_name)
     if spec is None:
         return pd.DataFrame(), pd.DataFrame()
@@ -1213,7 +1202,6 @@ def nested_cv(feature_set, model_name, X_dev, y_dev, numerical, categorical, gro
     bins_dev = make_target_bins(y_dev)
     grouped = GROUP_SPLIT_BY_MIX and groups is not None
 
-    # Build the outer folds: repeats of (Stratified)GroupKFold with different seeds.
     outer_folds = []
     for rep in range(NESTED_CV_OUTER_REPEATS):
         if grouped:
@@ -1321,7 +1309,6 @@ def build_stacking(best_params_by_model: Dict[str, Dict[str, Any]], numerical, c
     """Build an OOF-safe stacking regressor from the tuned base models (RidgeCV meta)."""
     estimators = []
     for name, bp in best_params_by_model.items():
-        # strip both the log-wrap prefix and the pipeline "model__" prefix to get raw estimator params
         clean = {k.replace("regressor__model__", "").replace("model__", ""): v for k, v in bp.items()}
         if name == "XGBoost" and HAS_XGBOOST:
             base = make_xgb(USE_GPU)
@@ -1425,8 +1412,9 @@ def plot_fit(y_true, y_pred, title, units, path) -> Dict[str, Any]:
     if np.isfinite(bf["slope"]):
         xs = np.linspace(mn, mx, 100)
         plt.plot(xs, bf["slope"] * xs + bf["intercept"], linewidth=2, label="Best-fit line")
-    plt.xlabel(f"Measured {TARGET} ({units})")
-    plt.ylabel(f"Predicted {TARGET} ({units})")
+    u = f" ({units})" if units else ""
+    plt.xlabel(f"Measured {TARGET}{u}")
+    plt.ylabel(f"Predicted {TARGET}{u}")
     plt.title(f"{title}\nR2={m['R2']:.3f}, RMSE={m['RMSE']:.3f}, MAE={m['MAE']:.3f}\n{bf['equation']}")
     plt.legend()
     plt.grid(True, alpha=0.3)
@@ -1451,22 +1439,22 @@ def plot_residuals(pred_df, split_name, out_dir) -> List[Dict[str, Any]]:
     if d.empty:
         return graphs
     base = safe_name(split_name)
-    graphs.append(plot_fit(d["Measured"], d["Predicted"], f"{split_name} measured vs predicted", "mm",
+    graphs.append(plot_fit(d["Measured"], d["Predicted"], f"{split_name} measured vs predicted", TARGET_UNITS,
                            out_dir / f"{base}_best_fit.png"))
-    for xcol, xlab, suffix in [("Predicted", "Predicted Rut_20k (mm)", "vs_predicted"),
-                                ("Measured", "Measured Rut_20k (mm)", "vs_measured")]:
+    for xcol, xlab, suffix in [("Predicted", f"Predicted {TARGET}", "vs_predicted"),
+                                ("Measured", f"Measured {TARGET}", "vs_measured")]:
         plt.figure(figsize=(7, 5))
         plt.scatter(d[xcol], d["Residual"], alpha=0.6, s=22)
         plt.axhline(0, ls="--", lw=2)
         plt.xlabel(xlab)
-        plt.ylabel("Residual: predicted - measured (mm)")
+        plt.ylabel("Residual: predicted - measured")
         plt.title(f"{split_name} residuals {suffix.replace('_', ' ')}")
         plt.grid(True, alpha=0.3)
         p = out_dir / f"{base}_residuals_{suffix}.png"
         save_fig(p)
         graphs.append({"Graph": p.name, "Type": f"Residuals {suffix}"})
     p = out_dir / f"{base}_residual_histogram.png"
-    plot_hist(d["Residual"], f"{split_name} residual distribution", "Residual (mm)", p)
+    plot_hist(d["Residual"], f"{split_name} residual distribution", "Residual", p)
     graphs.append({"Graph": p.name, "Type": "Residual histogram"})
     p = out_dir / f"{base}_abs_relative_error_hist.png"
     plot_hist(d["Abs_Relative_Error_pct"], f"{split_name} absolute relative error", "Absolute relative error (%)", p)
@@ -1474,7 +1462,7 @@ def plot_residuals(pred_df, split_name, out_dir) -> List[Dict[str, Any]]:
     plt.figure(figsize=(7, 5))
     plt.scatter(d["Measured"], d["Relative_Error_pct"], alpha=0.6, s=22)
     plt.axhline(0, ls="--", lw=2)
-    plt.xlabel("Measured Rut_20k (mm)")
+    plt.xlabel(f"Measured {TARGET}")
     plt.ylabel("Relative error (%)")
     plt.title(f"{split_name} relative error vs measured")
     plt.grid(True, alpha=0.3)
@@ -1845,7 +1833,7 @@ def final_refit_and_test(final_estimator, X_train, y_train, X_val, y_val, X_test
 def main():
     t0 = time.time()
     print("=" * 100)
-    print("RUT_20K WORKFLOW v2 — 70/10/20 + TRUE RBR + HIGH REG + STACKING + FULL DIAGNOSTICS")
+    print("SCB WORKFLOW v2 — 70/10/20 + TRUE RBR + HIGH REG + STACKING + FULL DIAGNOSTICS")
     print("=" * 100)
     print(f"Goal: push validation R2 toward {TARGET_VAL_R2:.2f}; keep the 20% test locked/hidden.")
     print(gpu_status_string())
@@ -1858,7 +1846,6 @@ def main():
     _GROUPS_FULL = df[GROUP_COL].astype(str).values if (GROUP_SPLIT_BY_MIX and GROUP_COL in df.columns) else None
     train_idx, val_idx, test_idx = stratified_70_10_20_split(df, y)
     if _GROUPS_FULL is not None:
-        # verify zero mix overlap across splits (proves no replicate leakage)
         g = _GROUPS_FULL
         leak = (len(set(g[train_idx]) & set(g[test_idx])) + len(set(g[val_idx]) & set(g[test_idx]))
                 + len(set(g[train_idx]) & set(g[val_idx])))
@@ -2034,7 +2021,6 @@ def main():
             try:
                 X_dev = pd.concat([obj["X_train"], obj["X_val"]], axis=0).reset_index(drop=True)
                 y_dev = pd.concat([obj["y_train"], obj["y_val"]], axis=0).reset_index(drop=True)
-                # groups aligned to X_dev (train rows then val rows), so no mix spans a CV fold
                 groups_dev = (np.concatenate([_GROUPS_FULL[train_idx], _GROUPS_FULL[val_idx]])
                               if _GROUPS_FULL is not None else None)
                 rc = repeated_cv_robust(obj["best_estimator"], X_dev, y_dev, groups=groups_dev)
@@ -2130,7 +2116,7 @@ def main():
         band_split_idx = {"Train70": train_idx, "Validation10": val_idx, "LockedTest20": test_idx}
         ad_targets = [("Validation10", val_idx), ("LockedTest20", test_idx)]
         metrics_sheet = "Final_TrainValTest_Metrics"
-        workbook_name = f"Rut20k_v3_{SPLIT_TAG}_WITH_LOCKED_TEST_Results.xlsx"
+        workbook_name = f"SCB_v3_{SPLIT_TAG}_WITH_LOCKED_TEST_Results.xlsx"
     else:
         mode_label = "DEVELOPMENT ONLY (locked 20% test untouched)"
         print("\n*** SCORE_LOCKED_TEST=False: DEVELOPMENT-ONLY run. "
@@ -2159,7 +2145,7 @@ def main():
         band_split_idx = {"Train70": train_idx, "Validation10": val_idx}
         ad_targets = [("Validation10", val_idx)]
         metrics_sheet = "Dev_Train_Val_Metrics"
-        workbook_name = f"Rut20k_v3_{SPLIT_TAG}_DEV_ONLY_train_val_Results.xlsx"
+        workbook_name = f"SCB_v3_{SPLIT_TAG}_DEV_ONLY_train_val_Results.xlsx"
 
     # ---- Real-time serving metrics for the selected model (latency + throughput) ----
     # Measured on the validation feature sample only — never the locked test.
@@ -2301,20 +2287,20 @@ def main():
 
     # ---- "How to reach R2 >= 0.80" data-collection recommendation ----
     data_reco_df = pd.DataFrame([
-        {"Priority": 1, "New_Predictor": "Continuous PG / binder rheology (DSR G*/sin d)",
-         "Why": "Binder stiffness governs rutting; current PG is a rounded 67-76 integer."},
-        {"Priority": 2, "New_Predictor": "Binder aging state (RTFO / PAV)",
-         "Why": "Aged binder resists rutting; not captured today."},
-        {"Priority": 3, "New_Predictor": "LWT test temperature",
-         "Why": "Rutting is highly temperature dependent; missing as a feature."},
+        {"Priority": 1, "New_Predictor": "Binder low/intermediate-temp rheology (BBR, DSR, delta-Tc)",
+         "Why": "Cracking resistance (SCB) is governed by binder ductility/relaxation at intermediate temperature, not captured by the high-temp PG grade alone."},
+        {"Priority": 2, "New_Predictor": "Binder aging state (RTFO / PAV) and RAP binder stiffness",
+         "Why": "Aging and stiff RAP binder embrittle the mix and lower SCB fracture energy."},
+        {"Priority": 3, "New_Predictor": "SCB test temperature",
+         "Why": "Fracture energy is strongly temperature dependent; missing as a feature."},
         {"Priority": 4, "New_Predictor": "Effective binder content / film thickness (Pbe)",
-         "Why": "Separates total AC from absorbed AC; drives rutting susceptibility."},
-        {"Priority": 5, "New_Predictor": "Traffic level as numeric ESALs",
-         "Why": "Load magnitude; only a coarse category exists now."},
-        {"Priority": 6, "New_Predictor": "Aggregate source / mineralogy",
-         "Why": "Angularity and texture affect shear resistance."},
-        {"Priority": "Note", "New_Predictor": "Feature engineering on the current 18 columns",
-         "Why": "Elbow curve shows OOF flat at ~0.50 regardless of feature count -> the ceiling is the data, not the features."},
+         "Why": "More effective binder generally improves cracking resistance."},
+        {"Priority": 5, "New_Predictor": "RAP/RAS source and blend ratio details",
+         "Why": "Recycled-binder availability and blending drive embrittlement."},
+        {"Priority": 6, "New_Predictor": "Aggregate source / mineralogy / angularity",
+         "Why": "Affects crack propagation and interlock."},
+        {"Priority": "Note", "New_Predictor": "Feature engineering on the current columns",
+         "Why": "As with the rutting model, adding combinations of existing columns hits a ceiling; new physical/binder measurements are the lever."},
     ])
 
     graph_index_df = pd.DataFrame(graph_rows)
@@ -2374,7 +2360,7 @@ def main():
     locked_test_file = PATHS["splits"] / "LOCKED_test_20pct_DO_NOT_USE_FOR_TUNING.xlsx"
     elapsed = time.time() - t0
     print("\n" + "=" * 100)
-    print(f"FINISHED RUT_20K v2 70/10/20 WORKFLOW — {mode_label}")
+    print(f"FINISHED SCB v2 70/10/20 WORKFLOW — {mode_label}")
     print("=" * 100)
     print(f"Workbook: {workbook}")
     print(f"Selected model: {final_model_path}")

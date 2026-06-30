@@ -115,6 +115,7 @@ from sklearn.model_selection import (
     RandomizedSearchCV,
     RepeatedKFold,
     StratifiedKFold,
+    StratifiedGroupKFold,
     learning_curve,
     train_test_split,
 )
@@ -199,11 +200,21 @@ SCORE_LOCKED_TEST = False
 CV_FOLDS = 5
 N_TARGET_BINS = 5
 
-# Tuning budget. Lower these for a fast check; raise N_ITER_XGB to 120+ for final runs.
-N_ITER_XGB = 120
-N_ITER_OTHER = 50
+# Tuning budget. Lower these for a fast check; raise for final runs (bigger search = better
+# hyper-parameter calibration, longer runtime). GPU makes the larger XGBoost search affordable.
+N_ITER_XGB = 160
+N_ITER_OTHER = 70
 N_JOBS_SEARCH = 1
 N_JOBS_MODEL = -1
+
+# ---- Leakage control: keep every replicate of a mix in the SAME split AND the SAME CV fold ----
+# When True, MixDesignKey (ID_COL) is used as a GROUP so the same physical mix can never appear
+# in train and test (or across CV folds). Split, training CV, RepeatedCV and Nested CV all become
+# group-aware (StratifiedGroupKFold). Removing this leakage usually LOWERS the reported R2 slightly
+# but it is the correct, defensible estimate.
+GROUP_SPLIT_BY_MIX = True
+GROUP_COL = ID_COL
+_GROUPS_FULL = None
 
 # Repeated-CV robustness (advisor "repeated CV"). Set REPEATS lower to save time.
 RUN_REPEATED_CV = True
@@ -681,22 +692,31 @@ def make_target_bins(y: pd.Series, n_bins: int = N_TARGET_BINS) -> pd.Series:
     return (y >= y.median()).astype(int)
 
 
-def stratified_70_10_20_split(df: pd.DataFrame, y: pd.Series):
-    """Two-stage stratified split. Hold out the 20% locked test FIRST, then carve dev into
-    70% train + 10% validation (10/80 = 0.125 of dev)."""
-    bins = make_target_bins(y)
-    idx = np.arange(len(y))
+def _first_fold_holdout(bins, groups, holdout_size, seed):
+    """Return (keep_idx, holdout_idx); holdout ~holdout_size, target-stratified, GROUP-safe."""
+    n = len(bins)
+    n_splits = max(2, int(round(1.0 / holdout_size)))
+    if groups is not None:
+        sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        keep, hold = next(iter(sgkf.split(np.zeros(n), bins, groups)))
+    else:
+        keep, hold = train_test_split(np.arange(n), test_size=holdout_size,
+                                      random_state=seed, shuffle=True, stratify=bins)
+    return np.array(keep), np.array(hold)
 
-    dev_idx, test_idx = train_test_split(
-        idx, test_size=TEST_SIZE, random_state=RANDOM_STATE, shuffle=True, stratify=bins,
-    )
+
+def stratified_70_10_20_split(df: pd.DataFrame, y: pd.Series):
+    """Two-stage split, GROUP-aware on MixDesignKey when GROUP_SPLIT_BY_MIX so no physical mix
+    appears in more than one split (eliminates replicate leakage)."""
+    bins = make_target_bins(y)
+    groups = None
+    if GROUP_SPLIT_BY_MIX and GROUP_COL in df.columns:
+        groups = df[GROUP_COL].astype(str).values
+    dev_idx, test_idx = _first_fold_holdout(bins, groups, TEST_SIZE, RANDOM_STATE)
     dev_bins = bins.iloc[dev_idx].reset_index(drop=True)
-    dev_positions = np.arange(len(dev_idx))
-    val_fraction_of_dev = VALIDATION_SIZE / (TRAIN_SIZE + VALIDATION_SIZE)  # 0.10/0.80 = 0.125
-    train_pos, val_pos = train_test_split(
-        dev_positions, test_size=val_fraction_of_dev, random_state=RANDOM_STATE,
-        shuffle=True, stratify=dev_bins,
-    )
+    dev_groups = groups[dev_idx] if groups is not None else None
+    val_fraction_of_dev = VALIDATION_SIZE / (TRAIN_SIZE + VALIDATION_SIZE)
+    train_pos, val_pos = _first_fold_holdout(dev_bins, dev_groups, val_fraction_of_dev, RANDOM_STATE)
     train_idx = dev_idx[train_pos]
     val_idx = dev_idx[val_pos]
     return np.array(train_idx), np.array(val_idx), np.array(test_idx)
@@ -756,11 +776,17 @@ def build_preprocessor(numerical: List[str], categorical: List[str]) -> ColumnTr
     return ColumnTransformer(transformers=transformers, remainder="drop", verbose_feature_names_out=False)
 
 
-def make_cv_splits_for_training(y_train: pd.Series):
+def make_cv_splits_for_training(y_train: pd.Series, groups_train=None):
     bins = make_target_bins(y_train)
-    cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    splits = list(cv.split(np.zeros(len(y_train)), bins))
-    return splits, f"Target-bin StratifiedKFold inside 70% training set ({CV_FOLDS} folds, {N_TARGET_BINS} bins)"
+    if GROUP_SPLIT_BY_MIX and groups_train is not None:
+        cv = StratifiedGroupKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+        splits = list(cv.split(np.zeros(len(y_train)), bins, groups_train))
+        name = f"Target-bin StratifiedGroupKFold (group=mix) inside training set ({CV_FOLDS} folds)"
+    else:
+        cv = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+        splits = list(cv.split(np.zeros(len(y_train)), bins))
+        name = f"Target-bin StratifiedKFold inside training set ({CV_FOLDS} folds, {N_TARGET_BINS} bins)"
+    return splits, name
 
 
 # =============================================================================
@@ -1145,12 +1171,18 @@ def rut_sample_weights(y) -> np.ndarray:
     return w
 
 
-def repeated_cv_robust(estimator, X, y, repeats=REPEATED_CV_REPEATS) -> Dict[str, float]:
-    """Repeated KFold on the 80% dev set for a stable generalization estimate (no test leakage)."""
+def repeated_cv_robust(estimator, X, y, repeats=REPEATED_CV_REPEATS, groups=None) -> Dict[str, float]:
+    """Repeated CV on the dev set; group-aware (StratifiedGroupKFold on mix) when grouping is on."""
+    bins = make_target_bins(y)
     scores = []
     for r in range(repeats):
-        cv = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE + 59 * r)
-        for tr, va in cv.split(X):
+        if GROUP_SPLIT_BY_MIX and groups is not None:
+            cv = StratifiedGroupKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE + 59 * r)
+            splitter = cv.split(np.zeros(len(y)), bins, groups)
+        else:
+            cv = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE + 59 * r)
+            splitter = cv.split(X)
+        for tr, va in splitter:
             est = clone(estimator)
             est.fit(X.iloc[tr], y.iloc[tr])
             scores.append(r2_score(y.iloc[va], est.predict(X.iloc[va])))
@@ -1159,20 +1191,36 @@ def repeated_cv_robust(estimator, X, y, repeats=REPEATED_CV_REPEATS) -> Dict[str
             "RepeatedCV_Min_R2": float(scores.min()), "RepeatedCV_N": int(len(scores))}
 
 
-def nested_cv(feature_set, model_name, X_dev, y_dev, numerical, categorical):
-    """Proper nested CV on the dev set: outer RepeatedKFold for an UNBIASED generalization
-    estimate, inner RandomizedSearchCV for tuning inside each outer fold (no leakage)."""
+def nested_cv(feature_set, model_name, X_dev, y_dev, numerical, categorical, groups=None):
+    """Proper, leakage-safe nested CV: preprocessing+tuning inside the Pipeline inside each fold;
+    outer and inner folds are StratifiedGroupKFold (no mix crosses a boundary) when grouping is on."""
     spec = define_models(feature_set).get(model_name)
     if spec is None:
         return pd.DataFrame(), pd.DataFrame()
-    outer = RepeatedKFold(n_splits=NESTED_CV_OUTER_SPLITS, n_repeats=NESTED_CV_OUTER_REPEATS, random_state=RANDOM_STATE)
     space = int(np.prod([len(v) for v in spec["params"].values()])) if spec["params"] else 1
     n_iter = min(NESTED_CV_INNER_NITER, max(1, space))
+    bins_dev = make_target_bins(y_dev)
+    grouped = GROUP_SPLIT_BY_MIX and groups is not None
+
+    outer_folds = []
+    for rep in range(NESTED_CV_OUTER_REPEATS):
+        if grouped:
+            ocv = StratifiedGroupKFold(n_splits=NESTED_CV_OUTER_SPLITS, shuffle=True, random_state=RANDOM_STATE + rep)
+            outer_folds += list(ocv.split(np.zeros(len(y_dev)), bins_dev, groups))
+        else:
+            ocv = StratifiedKFold(n_splits=NESTED_CV_OUTER_SPLITS, shuffle=True, random_state=RANDOM_STATE + rep)
+            outer_folds += list(ocv.split(np.zeros(len(y_dev)), bins_dev))
+
     rows = []
-    for i, (tr, te) in enumerate(outer.split(X_dev), start=1):
+    for i, (tr, te) in enumerate(outer_folds, start=1):
         Xtr, Xte = X_dev.iloc[tr], X_dev.iloc[te]
         ytr, yte = y_dev.iloc[tr], y_dev.iloc[te]
-        inner = KFold(n_splits=NESTED_CV_INNER_SPLITS, shuffle=True, random_state=RANDOM_STATE + i)
+        if grouped:
+            g_tr = np.asarray(groups)[tr]
+            inner = list(StratifiedGroupKFold(n_splits=NESTED_CV_INNER_SPLITS, shuffle=True,
+                         random_state=RANDOM_STATE + i).split(np.zeros(len(ytr)), make_target_bins(ytr), g_tr))
+        else:
+            inner = KFold(n_splits=NESTED_CV_INNER_SPLITS, shuffle=True, random_state=RANDOM_STATE + i)
         pipe = build_pipeline(clone(spec["estimator"]), numerical, categorical, scale=spec.get("scale", False))
         try:
             search = RandomizedSearchCV(pipe, log_param_grid(spec["params"]), n_iter=n_iter, scoring="r2", cv=inner,
@@ -1794,7 +1842,14 @@ def main():
     print(f"Output: {OUTPUT_FOLDER}")
 
     df, y, input_path = load_data()
+    global _GROUPS_FULL
+    _GROUPS_FULL = df[GROUP_COL].astype(str).values if (GROUP_SPLIT_BY_MIX and GROUP_COL in df.columns) else None
     train_idx, val_idx, test_idx = stratified_70_10_20_split(df, y)
+    if _GROUPS_FULL is not None:
+        g = _GROUPS_FULL
+        leak = (len(set(g[train_idx]) & set(g[test_idx])) + len(set(g[val_idx]) & set(g[test_idx]))
+                + len(set(g[train_idx]) & set(g[val_idx])))
+        print(f"Group leakage control ON (group={GROUP_COL}): mixes shared across splits = {leak} (must be 0)")
 
     split_summary = pd.DataFrame([
         {"Split": "Train70", "Rows": len(train_idx), "Percent": 100 * len(train_idx) / len(df), "Purpose": "fit/tune (5-fold CV)"},
@@ -1838,7 +1893,8 @@ def main():
         y_train, y_val, y_test = (y.iloc[train_idx].reset_index(drop=True),
                                   y.iloc[val_idx].reset_index(drop=True),
                                   y.iloc[test_idx].reset_index(drop=True))
-        cv_splits, cv_name = make_cv_splits_for_training(y_train)
+        groups_train = _GROUPS_FULL[train_idx] if _GROUPS_FULL is not None else None
+        cv_splits, cv_name = make_cv_splits_for_training(y_train, groups_train)
 
         print("\n" + "=" * 100)
         print(f"Feature set: {fs_name} | available={len(available)} | missing={missing or 'None'}")
@@ -1965,7 +2021,9 @@ def main():
             try:
                 X_dev = pd.concat([obj["X_train"], obj["X_val"]], axis=0).reset_index(drop=True)
                 y_dev = pd.concat([obj["y_train"], obj["y_val"]], axis=0).reset_index(drop=True)
-                rc = repeated_cv_robust(obj["best_estimator"], X_dev, y_dev)
+                groups_dev = (np.concatenate([_GROUPS_FULL[train_idx], _GROUPS_FULL[val_idx]])
+                              if _GROUPS_FULL is not None else None)
+                rc = repeated_cv_robust(obj["best_estimator"], X_dev, y_dev, groups=groups_dev)
                 rc.update({"Label": label, "Model": meta["Model"], "Feature_Set": meta["Feature_Set"],
                            "Validation_R2": meta.get("Validation_R2", np.nan),
                            "TrainOOF_R2": meta.get("TrainOOF_R2", np.nan)})
@@ -1998,8 +2056,9 @@ def main():
             Xn, n_num, n_cat, _, _ = get_X(df, FEATURE_SETS[NESTED_CV_FEATURE_SET])
             Xn_dev = Xn.iloc[dev_idx_all].reset_index(drop=True)
             yn_dev = y.iloc[dev_idx_all].reset_index(drop=True)
+            groups_nested = _GROUPS_FULL[dev_idx_all] if _GROUPS_FULL is not None else None
             nested_folds_df, nested_summary_df = nested_cv(NESTED_CV_FEATURE_SET, NESTED_CV_MODEL,
-                                                          Xn_dev, yn_dev, n_num, n_cat)
+                                                          Xn_dev, yn_dev, n_num, n_cat, groups=groups_nested)
             if not nested_summary_df.empty:
                 r = nested_summary_df.iloc[0]
                 print(f"  Nested CV R2 = {r['NestedCV_Mean_R2']:.4f} +/- {r['NestedCV_SD_R2']:.4f} "
@@ -2197,6 +2256,7 @@ def main():
         {"Setting": "Random state", "Value": RANDOM_STATE},
         {"Setting": "Train/Val/Test rows", "Value": f"{len(train_idx)}/{len(val_idx)}/{len(test_idx)}"},
         {"Setting": "Training CV", "Value": f"{CV_FOLDS}-fold target-bin StratifiedKFold inside 70% train"},
+        {"Setting": "Leakage control (group by mix)", "Value": (f"ON — group={GROUP_COL}; split + training CV + RepeatedCV + Nested CV are all StratifiedGroupKFold so no mix spans any fold" if GROUP_SPLIT_BY_MIX else "OFF (row-level split)")},
         {"Setting": "Repeated CV", "Value": f"{CV_FOLDS}x{REPEATED_CV_REPEATS} on 80% dev for best instance per model family + ensemble"},
         {"Setting": "N_ITER_XGB", "Value": N_ITER_XGB},
         {"Setting": "GPU status", "Value": gpu_status_string()},
