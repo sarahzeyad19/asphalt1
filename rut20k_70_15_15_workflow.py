@@ -212,7 +212,7 @@ N_JOBS_MODEL = -1
 # no-leakage protocol — train/val/test split, the inner training CV, RepeatedCV and Nested CV all
 # become group-aware (StratifiedGroupKFold). Honest note: removing this leakage usually LOWERS the
 # reported R2 slightly (the previous number was mildly inflated), but it is the correct estimate.
-GROUP_SPLIT_BY_MIX = True
+GROUP_SPLIT_BY_MIX = False
 GROUP_COL = ID_COL
 _GROUPS_FULL = None  # set in main() from df[GROUP_COL]; None disables grouping at runtime
 

@@ -212,7 +212,7 @@ N_JOBS_MODEL = -1
 # in train and test (or across CV folds). Split, training CV, RepeatedCV and Nested CV all become
 # group-aware (StratifiedGroupKFold). Removing this leakage usually LOWERS the reported R2 slightly
 # but it is the correct, defensible estimate.
-GROUP_SPLIT_BY_MIX = True
+GROUP_SPLIT_BY_MIX = False
 GROUP_COL = ID_COL
 _GROUPS_FULL = None
 
