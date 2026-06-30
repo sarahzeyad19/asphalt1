@@ -97,9 +97,21 @@ if QUICK_SMOKE_TEST:
 HOME = Path.home()
 DOWNLOADS = HOME / "Downloads"
 SHEET_NAME = "Cleaned_Dataset"
+SHEET_NAME_FALLBACKS = ["Cleaned_Dataset", "Cleaned_With_RBR", "Cleaned_Data_Kept", "Sheet1"]
 
 RUT_FILE = DOWNLOADS / "RUT_ModelReady_Cleaned_Dataset.xlsx"
 SCB_FILE = DOWNLOADS / "SCB_ModelReady_Cleaned_Dataset.xlsx"
+# Extra filenames to try automatically if the exact name above isn't found (e.g. files from an
+# earlier stage of this project, or Excel's "(1)" duplicate-download suffix).
+RUT_FILE_FALLBACKS = [
+    "RUT_ModelReady_Cleaned_Dataset (1).xlsx",
+    "Rutting_Cleaned_with_RBR.xlsx",
+    "Rutting_Cleaned_SpecBased.xlsx",
+]
+SCB_FILE_FALLBACKS = [
+    "SCB_ModelReady_Cleaned_Dataset (1).xlsx",
+    "SCB_Cleaned_with_RBR.xlsx",
+]
 
 OUTPUT_DIR = DOWNLOADS / "Rut_SCB_Tuned_Modeling_Outputs"
 FIG_DIR = OUTPUT_DIR / "figures"
@@ -153,26 +165,73 @@ OVERFIT_GAP_WARN = 0.15
 # DATA LOADING + VALIDATION
 # =============================================================================
 
-def load_dataset(path: Path, sheet_name: str = SHEET_NAME) -> pd.DataFrame:
-    """Load one Excel workbook's modeling sheet and normalise column names."""
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Could not find {path}. Put the file in your Downloads folder or update the path."
-        )
-    df = pd.read_excel(path, sheet_name=sheet_name)
+def resolve_file_path(primary: Path, fallback_names: List[str]) -> Path:
+    """Find the data file: try the exact primary path, then each fallback filename in
+    Downloads, then anywhere matching nearby (script directory, current working directory).
+    Raises a clear error listing the .xlsx files actually present in Downloads if none match,
+    so a wrong/renamed file is a one-glance fix instead of a guessing game."""
+    candidates = [primary] + [primary.parent / name for name in fallback_names]
+    try:
+        script_dir = Path(__file__).resolve().parent
+        candidates += [script_dir / c.name for c in list(candidates)]
+    except Exception:
+        pass
+    candidates += [Path.cwd() / c.name for c in list(candidates)]
+    seen = set()
+    for c in candidates:
+        if str(c) in seen:
+            continue
+        seen.add(str(c))
+        if c.exists():
+            if c != primary:
+                print(f"Note: using fallback file {c} (primary name {primary.name} not found).")
+            return c
+
+    present = sorted(p.name for p in primary.parent.glob("*.xlsx")) if primary.parent.exists() else []
+    raise FileNotFoundError(
+        f"Could not find {primary.name} (or any fallback name) in {primary.parent}.\n"
+        f"  Tried: {[c.name for c in candidates[:8]]}\n"
+        f"  .xlsx files actually present in {primary.parent}: {present or '(none found)'}\n"
+        f"  Fix: rename your file to {primary.name!r} and place it in {primary.parent}, "
+        f"or add its current name to the *_FILE_FALLBACKS list at the top of this script."
+    )
+
+
+def load_dataset(path: Path, fallback_names: Optional[List[str]] = None,
+                  sheet_name: str = SHEET_NAME) -> pd.DataFrame:
+    """Resolve the file (with fallback names), load its modeling sheet (with sheet-name
+    fallback), and normalise column names."""
+    resolved = resolve_file_path(path, fallback_names or [])
+    xls = pd.ExcelFile(resolved)
+    chosen_sheet = sheet_name if sheet_name in xls.sheet_names else None
+    if chosen_sheet is None:
+        for candidate in SHEET_NAME_FALLBACKS:
+            if candidate in xls.sheet_names:
+                chosen_sheet = candidate
+                break
+    if chosen_sheet is None:
+        chosen_sheet = xls.sheet_names[0]
+    if chosen_sheet != sheet_name:
+        print(f"Note: sheet {sheet_name!r} not found in {resolved.name}; using {chosen_sheet!r} "
+              f"(available sheets: {xls.sheet_names}).")
+    df = pd.read_excel(resolved, sheet_name=chosen_sheet)
     df.columns = [str(c).strip() for c in df.columns]
+    print(f"Loaded: {resolved}  (sheet={chosen_sheet!r}, rows={len(df)}, cols={df.shape[1]})")
     return df
 
 
 def check_columns(df: pd.DataFrame, target: str, features: List[str], id_col: str = ID_COL) -> None:
     """Verify the target, every requested predictor, and the group column all exist."""
     if target not in df.columns:
-        raise KeyError(f"Target column {target!r} not found. Available columns: {list(df.columns)}")
+        raise KeyError(f"Target column {target!r} not found.\n  Available columns: {list(df.columns)}")
     missing = [f for f in features if f not in df.columns]
     if missing:
-        raise KeyError(f"Missing predictor columns for target {target!r}: {missing}")
+        raise KeyError(
+            f"Missing predictor columns for target {target!r}: {missing}\n"
+            f"  Available columns in the file: {list(df.columns)}"
+        )
     if id_col not in df.columns:
-        raise KeyError(f"Group column {id_col!r} not found in the dataset.")
+        raise KeyError(f"Group column {id_col!r} not found.\n  Available columns: {list(df.columns)}")
 
 
 def assert_no_missing_values(df: pd.DataFrame, target: str, features: List[str], id_col: str = ID_COL) -> None:
@@ -187,6 +246,44 @@ def assert_no_missing_values(df: pd.DataFrame, target: str, features: List[str],
             f"Missing values found in required columns for target {target!r}:\n{bad.to_string()}\n"
             "Clean these values before running the workflow (no implicit imputation is performed)."
         )
+
+
+def _parse_adt_to_ordinal(value: Any) -> float:
+    """Convert a raw ADT value (numeric, or text like '3500 - 7000' / 'Low'/'Medium'/'High')
+    into a single numeric ordinal. Used only as a fallback when the file has a raw 'ADT'
+    column but not a pre-built 'ADT_ordinal' column."""
+    import re as _re
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    s = str(value).strip().lower().replace(",", "")
+    nums = [float(x) for x in _re.findall(r"\d+(?:\.\d+)?", s)]
+    if len(nums) >= 2:
+        return float(np.mean(nums[:2]))
+    if len(nums) == 1:
+        return nums[0]
+    if "low" in s:
+        return 1.0
+    if "medium" in s or "med" in s:
+        return 2.0
+    if "high" in s:
+        return 3.0
+    return np.nan
+
+
+def derive_adt_ordinal_if_missing(df: pd.DataFrame, features: List[str]) -> pd.DataFrame:
+    """If a script's feature list needs 'ADT_ordinal' but the file only has a raw 'ADT'
+    column (e.g. older cleaned files), derive it automatically instead of failing."""
+    if "ADT_ordinal" in features and "ADT_ordinal" not in df.columns:
+        candidates = [c for c in ["ADT_DOTD_ord", "ADT_ord", "ADT"] if c in df.columns]
+        if candidates:
+            src = candidates[0]
+            df = df.copy()
+            df["ADT_ordinal"] = df[src].apply(_parse_adt_to_ordinal)
+            print(f"Note: derived 'ADT_ordinal' from raw column {src!r} "
+                  "('ADT_ordinal' was not present in the file).")
+    return df
 
 
 def coerce_numeric(df: pd.DataFrame, numerical_cols: List[str]) -> pd.DataFrame:
@@ -613,9 +710,11 @@ def save_results_to_excel(
 # MAIN
 # =============================================================================
 
-def process_target(file_path: Path, target: str, features: List[str], target_label: str) -> Dict[str, Any]:
+def process_target(file_path: Path, target: str, features: List[str], target_label: str,
+                   fallback_names: Optional[List[str]] = None) -> Dict[str, Any]:
     """Load, validate, and run the full grouped-modeling workflow for one target."""
-    df = load_dataset(file_path)
+    df = load_dataset(file_path, fallback_names)
+    df = derive_adt_ordinal_if_missing(df, features)
     check_columns(df, target, features)
     numerical_in_set = [c for c in NUMERICAL_COLS_MASTER if c in features]
     df = coerce_numeric(df, numerical_in_set + [target])
@@ -680,8 +779,8 @@ def main() -> None:
     print(f"XGBoost={HAS_XGBOOST} CatBoost={HAS_CATBOOST} LightGBM={HAS_LIGHTGBM}")
     print(f"Output folder: {OUTPUT_DIR}")
 
-    rut_out = process_target(RUT_FILE, RUT_TARGET, RUT_FEATURES, "Rut_20k")
-    scb_out = process_target(SCB_FILE, SCB_TARGET, SCB_FEATURES, "SCB")
+    rut_out = process_target(RUT_FILE, RUT_TARGET, RUT_FEATURES, "Rut_20k", RUT_FILE_FALLBACKS)
+    scb_out = process_target(SCB_FILE, SCB_TARGET, SCB_FEATURES, "SCB", SCB_FILE_FALLBACKS)
 
     dataset_overview = pd.DataFrame([rut_out["summary"], scb_out["summary"]])
 
