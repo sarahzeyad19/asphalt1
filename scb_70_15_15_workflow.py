@@ -195,7 +195,7 @@ SPLIT_TAG = f"{int(TRAIN_SIZE*100)}_{int(VALIDATION_SIZE*100)}_{int(TEST_SIZE*10
 #       is NEVER read, scored, explained, or plotted. Results go to a separate DEV-ONLY workbook.
 # True: reveal the locked 20% test ONCE — refit the selected model on the 80% dev set and
 #       score + explain the test a single time (final-evaluation run).
-SCORE_LOCKED_TEST = False
+SCORE_LOCKED_TEST = True
 
 CV_FOLDS = 5
 N_TARGET_BINS = 5
@@ -240,9 +240,14 @@ AVERAGE_REPLICATES = False
 LOG_TARGET = False  # raw target (known-good baseline). SCB's target is the more right-skewed one,
                     # so log MIGHT help here — try LOG_TARGET=True and compare if you want.
 
-# ---- FORCE the final interpretable model (so SHAP/PDP run on a single tree model) ----
-# The Stacking ensemble cannot be SHAP-explained, so we lock the headline model to a single
-# tree model. Set both to None to fall back to automatic robust-score selection.
+# ---- Final-model selection ----
+# AUTO_SELECT_HIGHEST_VALIDATION: pick the final model as the candidate with the HIGHEST
+#   validation R2 among SHAP-capable single models (so SHAP/PDP still run on it). Overrides
+#   FORCE_FINAL_* below. Stacking is excluded only because it cannot be SHAP-explained.
+AUTO_SELECT_HIGHEST_VALIDATION = True
+SHAP_CAPABLE_MODELS = ["XGBoost", "LightGBM", "CatBoost", "RandomForest", "ExtraTrees", "GradientBoostingHuber"]
+
+# ---- FORCE a specific final model (used only when AUTO_SELECT_HIGHEST_VALIDATION = False) ----
 FORCE_FINAL_FEATURE_SET = "SHAP12_RBR"
 FORCE_FINAL_MODEL = "XGBoost"
 
@@ -2067,14 +2072,20 @@ def main():
             print(f"  Nested CV failed: {type(e).__name__}: {e}")
 
     # ---- Select final model ----
-    # Prefer the forced single tree model (so SHAP/PDP run); else automatic robust-score top.
     selected = None
-    if FORCE_FINAL_FEATURE_SET and FORCE_FINAL_MODEL:
+    if AUTO_SELECT_HIGHEST_VALIDATION:
+        cand = results_df[results_df["Model"].isin(SHAP_CAPABLE_MODELS)].sort_values(
+            "Validation_R2", ascending=False)
+        if not cand.empty:
+            selected = cand.iloc[0]
+            print(f"\nFinal model AUTO-SELECTED by HIGHEST validation R2 (SHAP-capable): "
+                  f"{selected['Label']} (Validation R2={selected['Validation_R2']:.4f})")
+    if selected is None and FORCE_FINAL_FEATURE_SET and FORCE_FINAL_MODEL:
         forced_label = f"{FORCE_FINAL_FEATURE_SET} | {FORCE_FINAL_MODEL}"
         cand = results_df[results_df["Label"] == forced_label]
         if not cand.empty:
             selected = cand.iloc[0]
-            print(f"\nFinal model FORCED to interpretable single tree model: {forced_label}")
+            print(f"\nFinal model FORCED to: {forced_label}")
         else:
             print(f"\nForced label {forced_label!r} not found; falling back to robust-score top.")
     if selected is None:
@@ -2091,7 +2102,7 @@ def main():
     band_series_full = df["RBR_band"] if "RBR_band" in df.columns else pd.Series(["NA"] * len(df))
     rbr_pct_full = pd.to_numeric(df.get("RBR_JMF_percent", pd.Series([np.nan] * len(df))), errors="coerce")
     rapxac_full = pd.to_numeric(df.get("RAP_pct_x_ACinRAP", pd.Series([np.nan] * len(df))), errors="coerce")
-    is_tree = obj["model_name"] in ["XGBoost", "LightGBM", "HistGradientBoosting", "CatBoost", "GradientBoosting"]
+    is_tree = obj["model_name"] in SHAP_CAPABLE_MODELS
     diag = PATHS["figures"] / "diagnostics"
 
     # =========================================================================
