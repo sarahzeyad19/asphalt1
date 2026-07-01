@@ -304,6 +304,40 @@ TARGET_MAE = 0.73
 AD_RBR_PERCENT_HIGH = None       # auto = 97.5th percentile if None
 AD_RAPxAC_HIGH = None            # auto = 97.5th percentile if None
 
+# =============================================================================
+# RESTRICTED-RANGE REPORTING + CALIBRATION + IMPORTANCE-BASED FEATURE SELECTION
+# (requested: keep the range where the model predicts well; adjust the final numbers with a
+#  calibration equation; select the highest-impact features; keep the STRATIFIED split.)
+# =============================================================================
+# HARD target-range filter applied in load_data BEFORE the split. Rows outside the range are
+# DROPPED and the model becomes an honestly-labelled restricted-range model. Used for SCB
+# (Jc < 1). For RUTTING we keep every row and instead REPORT the reliable band separately
+# (REPORT_INRANGE_BAND) so the full-range and in-range numbers are shown side by side.
+RESTRICT_TARGET_RANGE = False        # rutting: keep all rows (report the band instead of dropping)
+TARGET_RANGE_MIN = None              # inclusive lower bound (None = -inf)
+TARGET_RANGE_MAX = None              # upper bound (None = +inf)
+TARGET_RANGE_MAX_INCLUSIVE = True    # SCB sets this False so "Jc < 1" excludes exactly 1.0
+
+# REPORT (do NOT drop) the central band where the model is most reliable, side by side with the
+# full range, on every split. Rutting request = the central 2-7 mm band.
+REPORT_INRANGE_BAND = (2.0, 7.0)     # (min, max) in target units; None disables the in-range report
+
+# Compression-calibration equation. Fit  Measured = a * Predicted + b  on the DEV predictions and
+# apply it to every split so Predicted approx Measured (fixes the slope<1 compression -> lower
+# RMSE / MAE / bias, best-fit slope -> 1). HONEST NOTE: the reported R2 here is the coefficient of
+# determination (r2_score = 1 - SSres/SStot), which is NOT invariant to rescaling the prediction --
+# so correcting the compression typically RAISES the test R2 as well. This is legitimate: a and b
+# are learned on the DEV set only and applied once to the locked test (it is part of the model, not
+# tuning on the test). Reported as extra "*_Calibrated" rows so raw and calibrated are both visible.
+APPLY_CALIBRATION = True
+
+# Importance-based feature selection: rank the pooled candidate features by RandomForest importance
+# on the DEV rows only (no locked-test leakage) and register a reduced "TopImpact_Selected" set of
+# the K most impactful features, run through the normal pipeline alongside the other feature sets.
+ADD_TOP_IMPACT_FEATURE_SET = True
+TOP_IMPACT_K = 10
+TOP_IMPACT_POOL = "VolumetricsB_NoADT_RBR_Both"
+
 # Graph / analysis switches.
 SHOW_PLOTS_IN_SPYDER = True
 FIGURE_DPI = 200
@@ -679,6 +713,19 @@ def load_data() -> Tuple[pd.DataFrame, pd.Series, Path]:
     mask = y.notna()
     df = df.loc[mask].reset_index(drop=True)
     y = y.loc[mask].reset_index(drop=True)
+
+    # ---- HARD restricted-range filter (drop rows outside the reliable target range) ----
+    if RESTRICT_TARGET_RANGE:
+        lo = -np.inf if TARGET_RANGE_MIN is None else float(TARGET_RANGE_MIN)
+        hi = np.inf if TARGET_RANGE_MAX is None else float(TARGET_RANGE_MAX)
+        in_range = (y >= lo) & (y <= hi if TARGET_RANGE_MAX_INCLUSIVE else y < hi)
+        before = len(df)
+        df = df.loc[in_range.values].reset_index(drop=True)
+        y = y.loc[in_range.values].reset_index(drop=True)
+        bound = f"{TARGET} in [{lo}, {hi}{']' if TARGET_RANGE_MAX_INCLUSIVE else ')'}"
+        print(f"Restricted-range filter ON: {bound} -> kept {len(df)} of {before} rows "
+              f"({100*len(df)/max(before,1):.1f}%). Model is valid ONLY on this range.")
+
     print("\n" + "=" * 100)
     print(f"Loaded {TARGET} data")
     print("=" * 100)
@@ -773,6 +820,29 @@ def get_X(df: pd.DataFrame, requested: List[str]):
                 categorical.append(col)
                 X[col] = clean_categorical_series(X[col])
     return X, numerical, categorical, available, missing
+
+
+def importance_ranked_feature_set(df: pd.DataFrame, y: pd.Series, dev_idx, pool_name: str, k: int):
+    """Select the K most impactful features by RandomForest importance, fit on the DEV rows ONLY
+    (train+validation — never the locked test). Honest 'pick the features that actually affect the
+    model' step. Returns (top_feature_names, importance_series)."""
+    pool = FEATURE_SETS.get(pool_name, VOLUMETRICS_B_RBR_BOTH)
+    X, numerical, categorical, available, _ = get_X(df, pool)
+    dev_idx = np.asarray(dev_idx)
+    Xdev = X.iloc[dev_idx].reset_index(drop=True)
+    ydev = pd.Series(y).iloc[dev_idx].reset_index(drop=True)
+    frames = [Xdev[numerical].apply(lambda s: s.fillna(s.median()))]
+    for c in categorical:                                   # encode categoricals as integer codes
+        frames.append(pd.Series(pd.factorize(Xdev[c].astype(str))[0], name=c))
+    Xmat = pd.concat(frames, axis=1)
+    rf = RandomForestRegressor(n_estimators=400, random_state=RANDOM_STATE, n_jobs=N_JOBS_MODEL)
+    rf.fit(Xmat, ydev)
+    imp = pd.Series(rf.feature_importances_, index=Xmat.columns).sort_values(ascending=False)
+    top = list(imp.head(k).index)
+    print(f"\nImportance-based feature selection (RandomForest on DEV, pool={pool_name}, top {k}):")
+    for f in top:
+        print(f"    {f:<28} importance={imp[f]:.4f}")
+    return top, imp
 
 
 def make_ohe():
@@ -1844,7 +1914,44 @@ def final_refit_and_test(final_estimator, X_train, y_train, X_val, y_val, X_test
         rows.append({"Dataset": ds, "Rows": len(sub), **m,
                      "HighRut_MAE_q80": high_rut_mae(sub["Measured"], sub["Predicted"], 0.80),
                      **rel, "BestFit_Equation": bf["equation"]})
-    return final_est, X_dev, y_dev, pred_df, pd.DataFrame(rows)
+    metrics_df = pd.DataFrame(rows)
+
+    # ---- Compression-calibration equation (fit on DEV, applied to every split) ----
+    if APPLY_CALIBRATION:
+        dev = pred_df[pred_df["Dataset"] == "Dev80_FinalFit"]
+        a, b = np.polyfit(dev["Predicted"].values, dev["Measured"].values, 1)  # Measured = a*Pred + b
+        a, b = float(a), float(b)
+        pred_df["Predicted_Calibrated"] = a * pred_df["Predicted"] + b
+        cal_rows = []
+        for ds, sub in pred_df.groupby("Dataset"):
+            m = metrics(sub["Measured"], sub["Predicted_Calibrated"])
+            bf = best_fit(sub["Measured"], sub["Predicted_Calibrated"])
+            cal_rows.append({"Dataset": f"{ds}_Calibrated", "Rows": len(sub), **m,
+                             "HighRut_MAE_q80": high_rut_mae(sub["Measured"], sub["Predicted_Calibrated"], 0.80),
+                             "BestFit_Equation": bf["equation"]})
+        metrics_df = pd.concat([metrics_df, pd.DataFrame(cal_rows)], ignore_index=True)
+        print(f"\nCalibration equation  Measured = {a:.4f} * Predicted + {b:.4f}  "
+              f"(learned on DEV, applied once to the locked test; corrects compression -> "
+              f"lower RMSE/MAE/bias AND typically higher coefficient-of-determination R2).")
+
+    # ---- In-range band report (do not drop; show reliable band beside the full range) ----
+    if REPORT_INRANGE_BAND:
+        lo, hi = REPORT_INRANGE_BAND
+        band_rows = []
+        for ds, sub in pred_df.groupby("Dataset"):
+            m_in = sub[(sub["Measured"] >= lo) & (sub["Measured"] <= hi)]
+            if len(m_in) < 3:
+                continue
+            m = metrics(m_in["Measured"], m_in["Predicted"])
+            bf = best_fit(m_in["Measured"], m_in["Predicted"])
+            band_rows.append({"Dataset": f"{ds}_InRange_{lo:g}-{hi:g}", "Rows": len(m_in), **m,
+                              "HighRut_MAE_q80": high_rut_mae(m_in["Measured"], m_in["Predicted"], 0.80),
+                              "BestFit_Equation": bf["equation"]})
+        if band_rows:
+            metrics_df = pd.concat([metrics_df, pd.DataFrame(band_rows)], ignore_index=True)
+            print(f"In-range report added for {TARGET} in [{lo:g}, {hi:g}] "
+                  f"(shown beside the full range on every split).")
+    return final_est, X_dev, y_dev, pred_df, metrics_df
 
 
 # =============================================================================
@@ -1887,6 +1994,17 @@ def main():
 
     # Statistical analysis on DEV data only (no test leakage).
     dev_idx_all = np.concatenate([train_idx, val_idx])
+
+    # ---- Importance-based feature selection: register a reduced high-impact feature set ----
+    if ADD_TOP_IMPACT_FEATURE_SET:
+        try:
+            top_feats, _imp = importance_ranked_feature_set(df, y, dev_idx_all, TOP_IMPACT_POOL, TOP_IMPACT_K)
+            FEATURE_SETS["TopImpact_Selected"] = top_feats
+            if "TopImpact_Selected" not in FEATURE_SETS_TO_RUN:
+                FEATURE_SETS_TO_RUN.append("TopImpact_Selected")
+        except Exception as e:
+            print(f"TopImpact feature selection skipped: {type(e).__name__}: {e}")
+
     stat_features = sorted(set(VOLUMETRICS_B_RBR_BOTH + PHYSICAL_INTERACTIONS))
     desc_df, corr_df, vif_df = statistical_analysis(
         df.iloc[dev_idx_all].reset_index(drop=True), y.iloc[dev_idx_all].reset_index(drop=True),
