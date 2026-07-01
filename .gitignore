@@ -5,4 +5,5 @@ __pycache__/
 
 # Generated model outputs (workbooks, figures, splits, joblib models)
 *_outputs/
+*_Outputs/
 *.joblib
