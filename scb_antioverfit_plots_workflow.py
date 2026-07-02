@@ -55,6 +55,11 @@ try:
     HAS_OPTUNA = True
 except Exception:
     HAS_OPTUNA = False
+try:
+    from tabpfn import TabPFNRegressor          # pip install tabpfn  (foundation model for small tables)
+    HAS_TABPFN = True
+except Exception:
+    HAS_TABPFN = False
 
 # ---------------- settings ----------------
 RANDOM_STATE = 42
@@ -62,6 +67,12 @@ TARGET, UNITS = "SCB", "kJ/m2"
 TEST_SIZE, CV_FOLDS = 0.25, 5
 N_TRIALS = 150
 REPEATED_K, REPEATED_REPEATS = 10, 5
+USE_TABPFN = True               # add TabPFN as a candidate + stacking base (no tuning needed)
+TABPFN_DEVICE = "auto"          # "auto" -> cuda if available else cpu; or force "cuda"/"cpu"
+# TabPFN one-time setup: pip install tabpfn, then accept the model terms at
+#   https://huggingface.co/Prior-Labs/tabpfn_3  and authenticate once via `hf auth login`
+#   (or set env var HF_TOKEN=<your read token>). Weights download on first fit only.
+#   If tabpfn is absent or unauthenticated, the script prints a note and runs the other models.
 OVERFIT_PENALTY = 0.15          # weight on the train-CV gap (0 = pure CV; higher = simpler/less overfit).
                                 # 0.10-0.20 shrinks the gap without crushing the score; 0.30+ is aggressive.
 FEATURE_SELECTION, TOP_K = True, 12
@@ -211,16 +222,43 @@ def main():
           f"| Optuna={HAS_OPTUNA}({N_TRIALS}) | gap_penalty={OVERFIT_PENALTY} | bag={BAG_SEEDS}")
     print(f"Selected features: {feats}"); print("=" * 92)
 
+    def make_tabpfn():
+        dev = TABPFN_DEVICE
+        if dev == "auto":
+            try:
+                import torch; dev = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                dev = "cpu"
+        try:
+            reg = TabPFNRegressor(device=dev, random_state=RANDOM_STATE)
+        except TypeError:
+            reg = TabPFNRegressor(device=dev)      # older/newer API without random_state
+        return make_pipe(reg, feats)
+
     names = ["RandomForest", "ExtraTrees", "HistGB"] + (["XGBoost"] if HAS_XGB else [])
+    if USE_TABPFN and HAS_TABPFN:
+        names.append("TabPFN")
+    elif USE_TABPFN and not HAS_TABPFN:
+        print("TabPFN requested but not installed -> skipping. Install with: pip install tabpfn")
     tuned, rows, cv_dist = {}, [], {}
     for nm in names:
-        best = tune(nm, Xtr, ytr, feats); tuned[nm] = best
-        sc = repeated_cv_scores(best, Xtr, ytr); cv_dist[nm] = sc
+        # TabPFN is a pretrained foundation model: fit/predict, NO hyper-parameter tuning.
+        best = make_tabpfn() if nm == "TabPFN" else tune(nm, Xtr, ytr, feats)
+        if nm == "TabPFN":
+            best.fit(Xtr, ytr)
+        tuned[nm] = best
+        try:
+            sc = repeated_cv_scores(best, Xtr, ytr)
+        except Exception as e:
+            print(f"  {nm}: RepeatedCV failed ({type(e).__name__}); using single 5-fold. {e}")
+            sc = np.array([np.mean(cross_val_score(clone(best), Xtr, ytr,
+                          cv=KFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE), scoring="r2"))])
+        cv_dist[nm] = sc
         tr_m, te_m = metrics(ytr, best.predict(Xtr)), metrics(yte, best.predict(Xte))
         rows.append({"Model": nm, "Train_R2": tr_m["R2"], "RepeatedCV_R2": float(sc.mean()),
-                     "RepeatedCV_SD": float(sc.std(ddof=1)), "Test_R2": te_m["R2"],
+                     "RepeatedCV_SD": float(sc.std(ddof=1)) if len(sc) > 1 else 0.0, "Test_R2": te_m["R2"],
                      "Test_RMSE": te_m["RMSE"], "Overfit_Gap": tr_m["R2"] - float(sc.mean())})
-        print(f"  {nm:14s} Train={tr_m['R2']:.3f} | RepeatedCV={sc.mean():.3f}±{sc.std(ddof=1):.3f} "
+        print(f"  {nm:14s} Train={tr_m['R2']:.3f} | RepeatedCV={sc.mean():.3f}±{sc.std(ddof=1) if len(sc)>1 else 0:.3f} "
               f"| Test={te_m['R2']:.3f} | gap={tr_m['R2']-sc.mean():.3f}")
 
     stack = StackingRegressor([(n, clone(tuned[n])) for n in names],
