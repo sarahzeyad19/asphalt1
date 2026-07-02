@@ -69,10 +69,13 @@ N_TRIALS = 150
 REPEATED_K, REPEATED_REPEATS = 10, 5
 USE_TABPFN = True               # add TabPFN as a candidate + stacking base (no tuning needed)
 TABPFN_DEVICE = "auto"          # "auto" -> cuda if available else cpu; or force "cuda"/"cpu"
-# TabPFN one-time setup: pip install tabpfn, then accept the model terms at
-#   https://huggingface.co/Prior-Labs/tabpfn_3  and authenticate once via `hf auth login`
-#   (or set env var HF_TOKEN=<your read token>). Weights download on first fit only.
-#   If tabpfn is absent or unauthenticated, the script prints a note and runs the other models.
+# TabPFN one-time setup (this tabpfn build uses PRIOR LABS auth, not Hugging Face):
+#   1) pip install tabpfn
+#   2) open https://ux.priorlabs.ai , log in / register, accept the license on the "Licenses" tab
+#   3) copy your API key from https://ux.priorlabs.ai/account
+#   4) set it once:  Anaconda Prompt ->  setx TABPFN_TOKEN "your-key-here"   then restart Spyder
+#      (or in Python before running:  import os; os.environ["TABPFN_TOKEN"] = "your-key-here")
+#   If TabPFN is absent or unauthenticated, the script now SKIPS it and runs everything else.
 OVERFIT_PENALTY = 0.15          # weight on the train-CV gap (0 = pure CV; higher = simpler/less overfit).
                                 # 0.10-0.20 shrinks the gap without crushing the score; 0.30+ is aggressive.
 FEATURE_SELECTION, TOP_K = True, 12
@@ -243,9 +246,20 @@ def main():
     tuned, rows, cv_dist = {}, [], {}
     for nm in names:
         # TabPFN is a pretrained foundation model: fit/predict, NO hyper-parameter tuning.
-        best = make_tabpfn() if nm == "TabPFN" else tune(nm, Xtr, ytr, feats)
-        if nm == "TabPFN":
-            best.fit(Xtr, ytr)
+        # Wrap the whole build so a TabPFN license/download error SKIPS it instead of killing
+        # the run (you still get the other models, stacking, plots and the Excel).
+        try:
+            best = make_tabpfn() if nm == "TabPFN" else tune(nm, Xtr, ytr, feats)
+            if nm == "TabPFN":
+                best.fit(Xtr, ytr)
+        except Exception as e:
+            print(f"  {nm:14s} SKIPPED ({type(e).__name__}): {str(e).splitlines()[0]}")
+            if nm == "TabPFN":
+                print("  -> TabPFN needs a one-time license. Open https://ux.priorlabs.ai , log in, accept the\n"
+                      "     license on the 'Licenses' tab, copy your API key from https://ux.priorlabs.ai/account ,\n"
+                      "     then set it once:  Anaconda Prompt ->  setx TABPFN_TOKEN \"your-key-here\"  and restart Spyder.\n"
+                      "     (Or set USE_TABPFN=False at the top to skip TabPFN entirely.)")
+            continue
         tuned[nm] = best
         try:
             sc = repeated_cv_scores(best, Xtr, ytr)
@@ -261,7 +275,8 @@ def main():
         print(f"  {nm:14s} Train={tr_m['R2']:.3f} | RepeatedCV={sc.mean():.3f}±{sc.std(ddof=1) if len(sc)>1 else 0:.3f} "
               f"| Test={te_m['R2']:.3f} | gap={tr_m['R2']-sc.mean():.3f}")
 
-    stack = StackingRegressor([(n, clone(tuned[n])) for n in names],
+    trained_names = [n for n in names if n in tuned]      # only models that actually fit (TabPFN may be skipped)
+    stack = StackingRegressor([(n, clone(tuned[n])) for n in trained_names],
                               final_estimator=RidgeCV(alphas=[0.1, 1.0, 10.0]), cv=CV_FOLDS, n_jobs=1)
     stack.fit(Xtr, ytr); sc = repeated_cv_scores(stack, Xtr, ytr); cv_dist["Stacking"] = sc
     tr_m, te_m = metrics(ytr, stack.predict(Xtr)), metrics(yte, stack.predict(Xte))
