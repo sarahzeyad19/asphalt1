@@ -311,11 +311,13 @@ def main():
     print(f"CV-SELECTED (RepeatedCV-first): {sel_name}  RepeatedCV={sel['RepeatedCV_R2']:.3f} | Test={sel['Testing_R2']:.3f}")
     print("=" * 92)
 
-    # ---- Nested CV (unbiased) for the selected single model ----
-    nested = {"Mean": np.nan}
-    if sel_name != "Stacking":
-        nested = nested_cv(sel_name, pd.concat([Xtr, Xte]).reset_index(drop=True),
-                           pd.concat([ytr, yte]).reset_index(drop=True), features)
+    # ---- Nested CV (unbiased). Stacking cannot be nested-tuned here, so report the unbiased
+    #      estimate of the best SINGLE model so the ladder always has an unbiased number. ----
+    nested_name = sel_name if sel_name != "Stacking" else \
+        res[res["Model"] != "Stacking"].iloc[0]["Model"]
+    nested = nested_cv(nested_name, pd.concat([Xtr, Xte]).reset_index(drop=True),
+                       pd.concat([ytr, yte]).reset_index(drop=True), features)
+    nested["Model"] = nested_name
 
     # ---- OOF-fit calibration (learned on TRAIN OOF, applied once to test) ----
     test_pred = sel_est.predict(Xte)
@@ -333,7 +335,7 @@ def main():
         {"Stage": "5-fold CV (Optuna objective)", "R2": sel["CV5_R2"]},
         {"Stage": f"RepeatedCV {REPEATED_K}x{REPEATED_REPEATS}", "R2": sel["RepeatedCV_R2"]},
         {"Stage": "RepeatedCV min fold", "R2": sel["RepeatedCV_Min"]},
-        {"Stage": "Nested CV (unbiased)", "R2": nested["Mean"]},
+        {"Stage": f"Nested CV (unbiased, {nested_name})", "R2": nested["Mean"]},
         {"Stage": "Independent test (raw)", "R2": raw["R2"]},
         {"Stage": "Independent test (calibrated)", "R2": cal["R2"]},
         {"Stage": "Independent test (adjusted R2)", "R2": sel.get("Testing_Adjusted_R2", np.nan)},
