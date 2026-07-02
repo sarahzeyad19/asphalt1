@@ -248,6 +248,13 @@ LOG_TARGET = False  # raw target. (Log lowered rutting numbers — the target is
 #   "choose the model with the higher validation and test on it". Overrides FORCE_FINAL_* below.
 #   The Stacking ensemble is excluded only because it cannot be SHAP-explained.
 AUTO_SELECT_HIGHEST_VALIDATION = True
+# AUTO_SELECT_METRIC: WHICH score the auto-selection ranks by.
+#   "TrainOOF_R2" (default, HONEST) -> out-of-fold CV R2 on the training set: a stable, leakage-free
+#       estimate that tracks the locked test far better than a single small validation slice, so it
+#       avoids crowning a model that only got lucky on one fold.
+#   "Validation_R2" -> old behaviour (highest single-split validation); noisy on small validation
+#       sets and can over-reward a lucky slice.
+AUTO_SELECT_METRIC = "TrainOOF_R2"
 # Models that shap.TreeExplainer can explain (so SHAP/PDP run on the selected model).
 # StackingRegressor and HistGradientBoosting are excluded (TreeExplainer cannot handle them).
 SHAP_CAPABLE_MODELS = ["XGBoost", "LightGBM", "CatBoost", "RandomForest", "ExtraTrees", "GradientBoostingHuber"]
@@ -2210,13 +2217,15 @@ def main():
     # ---- Select final model ----
     selected = None
     if AUTO_SELECT_HIGHEST_VALIDATION:
-        # highest validation R2 among SHAP-capable single models (keeps SHAP/PDP working)
+        # honest CV score among SHAP-capable single models (keeps SHAP/PDP working)
+        sort_col = AUTO_SELECT_METRIC if AUTO_SELECT_METRIC in results_df.columns else "Validation_R2"
         cand = results_df[results_df["Model"].isin(SHAP_CAPABLE_MODELS)].sort_values(
-            "Validation_R2", ascending=False)
+            sort_col, ascending=False)
         if not cand.empty:
             selected = cand.iloc[0]
-            print(f"\nFinal model AUTO-SELECTED by HIGHEST validation R2 (SHAP-capable): "
-                  f"{selected['Label']} (Validation R2={selected['Validation_R2']:.4f})")
+            print(f"\nFinal model AUTO-SELECTED by HIGHEST {sort_col} (SHAP-capable, honest CV): "
+                  f"{selected['Label']} ({sort_col}={selected[sort_col]:.4f}, "
+                  f"Validation R2={selected['Validation_R2']:.4f})")
     if selected is None and FORCE_FINAL_FEATURE_SET and FORCE_FINAL_MODEL:
         forced_label = f"{FORCE_FINAL_FEATURE_SET} | {FORCE_FINAL_MODEL}"
         cand = results_df[results_df["Label"] == forced_label]

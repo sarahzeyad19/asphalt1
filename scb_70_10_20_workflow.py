@@ -241,10 +241,19 @@ LOG_TARGET = False  # raw target (known-good baseline). SCB's target is the more
                     # so log MIGHT help here — try LOG_TARGET=True and compare if you want.
 
 # ---- Final-model selection ----
-# AUTO_SELECT_HIGHEST_VALIDATION: pick the final model as the candidate with the HIGHEST
-#   validation R2 among SHAP-capable single models (so SHAP/PDP still run on it). Overrides
-#   FORCE_FINAL_* below. Stacking is excluded only because it cannot be SHAP-explained.
+# AUTO_SELECT_HIGHEST_VALIDATION: pick the final model automatically among SHAP-capable single
+#   models (so SHAP/PDP still run on it). Overrides FORCE_FINAL_* below. Stacking is excluded only
+#   because it cannot be SHAP-explained.
 AUTO_SELECT_HIGHEST_VALIDATION = True
+# AUTO_SELECT_METRIC: WHICH score to rank by.
+#   "TrainOOF_R2" (default, HONEST) -> out-of-fold CV R2 on the training set. This is a stable,
+#       leakage-free estimate of generalization and it TRACKS the locked test far better than the
+#       single validation slice. Use this to avoid picking a model that only got lucky on a small
+#       validation fold (e.g. SCB: CatBoost validation 0.665 but OOF 0.40, locked test 0.496 --
+#       while ExtraTrees OOF ~0.46 / RepeatedCV ~0.51 was the genuinely better generalizer).
+#   "Validation_R2" -> the old behaviour (highest single-split validation). Noisy on small
+#       validation sets (SCB validation is only ~72 rows) and can over-reward a lucky slice.
+AUTO_SELECT_METRIC = "TrainOOF_R2"
 SHAP_CAPABLE_MODELS = ["XGBoost", "LightGBM", "CatBoost", "RandomForest", "ExtraTrees", "GradientBoostingHuber"]
 
 # ---- FORCE a specific final model (used only when AUTO_SELECT_HIGHEST_VALIDATION = False) ----
@@ -2189,12 +2198,14 @@ def main():
     # ---- Select final model ----
     selected = None
     if AUTO_SELECT_HIGHEST_VALIDATION:
+        sort_col = AUTO_SELECT_METRIC if AUTO_SELECT_METRIC in results_df.columns else "Validation_R2"
         cand = results_df[results_df["Model"].isin(SHAP_CAPABLE_MODELS)].sort_values(
-            "Validation_R2", ascending=False)
+            sort_col, ascending=False)
         if not cand.empty:
             selected = cand.iloc[0]
-            print(f"\nFinal model AUTO-SELECTED by HIGHEST validation R2 (SHAP-capable): "
-                  f"{selected['Label']} (Validation R2={selected['Validation_R2']:.4f})")
+            print(f"\nFinal model AUTO-SELECTED by HIGHEST {sort_col} (SHAP-capable, honest CV): "
+                  f"{selected['Label']} ({sort_col}={selected[sort_col]:.4f}, "
+                  f"Validation R2={selected['Validation_R2']:.4f})")
     if selected is None and FORCE_FINAL_FEATURE_SET and FORCE_FINAL_MODEL:
         forced_label = f"{FORCE_FINAL_FEATURE_SET} | {FORCE_FINAL_MODEL}"
         cand = results_df[results_df["Label"] == forced_label]
