@@ -91,10 +91,20 @@ ALIASES = {
     ID_COL: [ID_COL, "MixDesignKey"],
 }
 
+# ---- EASIEST FIX: if auto-find fails, paste the FULL path to each file here (keep the r"" quotes) ----
+OLD_FILE = r""     # e.g. r"C:\Users\lenovo\Downloads\SCB_Cleaned_with_RBR.xlsx"
+NEW_FILE = r""     # e.g. r"C:\Users\lenovo\OneDrive\Desktop\.ipynb_checkpoints\updated_preprocessing_cleaning_workflow\Final_Cleaned_590Dataset_User_Removal_Rules.xlsx"
+
+_DESK = Path.home() / "Desktop"
+_ONEDESK = Path.home() / "OneDrive" / "Desktop"
 OLD_CANDIDATES = [Path("SCB_Cleaned_with_RBR.xlsx"), Path.home() / "Downloads" / "SCB_Cleaned_with_RBR.xlsx",
+                  _DESK / "SCB_Cleaned_with_RBR.xlsx", _ONEDESK / "SCB_Cleaned_with_RBR.xlsx",
                   Path("/tmp/claude-0/-home-user-asphalt1/2de3e2fd-e268-5a6b-af7f-ada01b8f275d/scratchpad/SCB_Cleaned_with_RBR.xlsx")]
 NEW_CANDIDATES = [Path("Final_Cleaned_590Dataset_User_Removal_Rules.xlsx"),
                   Path.home() / "Downloads" / "Final_Cleaned_590Dataset_User_Removal_Rules.xlsx",
+                  _ONEDESK / ".ipynb_checkpoints" / "updated_preprocessing_cleaning_workflow" / "Final_Cleaned_590Dataset_User_Removal_Rules.xlsx",
+                  _DESK / "Final_Cleaned_590Dataset_User_Removal_Rules.xlsx",
+                  _ONEDESK / "Final_Cleaned_590Dataset_User_Removal_Rules.xlsx",
                   Path("/root/.claude/uploads/2de3e2fd-e268-5a6b-af7f-ada01b8f275d/b2f34a91-Final_Cleaned_590Dataset_User_Removal_Rules.xlsx")]
 # Fuzzy fallbacks: match files even if renamed with a "(1)" suffix, a download hash prefix, etc.
 OLD_PATTERNS = ["*SCB_Cleaned_with_RBR*.xlsx", "*SCB_Cleaned*.xlsx"]
@@ -111,21 +121,34 @@ def resolve(cands, patterns=None):
                 return p
         except Exception:
             pass
-    # 2) fuzzy glob in the script folder, current working dir, and Downloads
+    # 2) fuzzy glob in the script folder, current working dir, Downloads, Desktop, OneDrive Desktop
     if patterns:
-        search_dirs = []
+        top_dirs = []
         try:
-            search_dirs.append(Path(__file__).resolve().parent)
+            top_dirs.append(Path(__file__).resolve().parent)
         except Exception:
             pass
-        search_dirs += [Path.cwd(), Path.home() / "Downloads"]
+        top_dirs += [Path.cwd(), Path.home() / "Downloads",
+                     Path.home() / "Desktop", Path.home() / "OneDrive" / "Desktop"]
         seen = set()
-        for d in search_dirs:
+        # 2a) fast: non-recursive in each top dir
+        for d in top_dirs:
             if not d or str(d) in seen or not d.exists():
                 continue
             seen.add(str(d))
             for pat in patterns:
                 hits = sorted(d.glob(pat))
+                if hits:
+                    return hits[0]
+        # 2b) last resort: recursive search under Downloads / Desktop / OneDrive Desktop
+        for d in [Path.home() / "Downloads", Path.home() / "Desktop", Path.home() / "OneDrive" / "Desktop"]:
+            if not d.exists():
+                continue
+            for pat in patterns:
+                try:
+                    hits = sorted(d.rglob(pat))
+                except Exception:
+                    hits = []
                 if hits:
                     return hits[0]
     return None
@@ -262,7 +285,8 @@ def parity(y, p, title, path):
 
 # =============================================================================
 def main():
-    old_p, new_p = resolve(OLD_CANDIDATES, OLD_PATTERNS), resolve(NEW_CANDIDATES, NEW_PATTERNS)
+    old_p = Path(OLD_FILE) if OLD_FILE and Path(OLD_FILE).exists() else resolve(OLD_CANDIDATES, OLD_PATTERNS)
+    new_p = Path(NEW_FILE) if NEW_FILE and Path(NEW_FILE).exists() else resolve(NEW_CANDIDATES, NEW_PATTERNS)
     if old_p is None or new_p is None:
         here = Path.cwd()
         found = sorted(str(p.name) for p in here.glob("*.xlsx"))
@@ -270,8 +294,10 @@ def main():
             f"Need both files. old={old_p} new={new_p}.\n"
             f"  Working folder: {here}\n"
             f"  .xlsx files I can see here: {found}\n"
-            "  Put BOTH files in this folder. The old one should contain 'SCB_Cleaned_with_RBR' in its "
-            "name; the new one should contain '590' in its name (a (1) suffix or extra prefix is fine).")
+            "  There is no '590' file in this folder — the new dataset is probably on your Desktop/OneDrive.\n"
+            "  EASIEST FIX: open the script, and at the top paste the full path into NEW_FILE (and OLD_FILE\n"
+            '  if needed), e.g. NEW_FILE = r"C:\\Users\\lenovo\\OneDrive\\Desktop\\...\\Final_Cleaned_590Dataset_User_Removal_Rules.xlsx"\n'
+            "  Or just copy both Excel files into this Downloads folder next to the script.")
     print(f"OLD file: {old_p}\nNEW file: {new_p}")
     old = harmonize(read_best_sheet(old_p), "old")
     new = harmonize(read_best_sheet(new_p), "new")
