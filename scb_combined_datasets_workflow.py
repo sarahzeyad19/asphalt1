@@ -96,14 +96,38 @@ OLD_CANDIDATES = [Path("SCB_Cleaned_with_RBR.xlsx"), Path.home() / "Downloads" /
 NEW_CANDIDATES = [Path("Final_Cleaned_590Dataset_User_Removal_Rules.xlsx"),
                   Path.home() / "Downloads" / "Final_Cleaned_590Dataset_User_Removal_Rules.xlsx",
                   Path("/root/.claude/uploads/2de3e2fd-e268-5a6b-af7f-ada01b8f275d/b2f34a91-Final_Cleaned_590Dataset_User_Removal_Rules.xlsx")]
+# Fuzzy fallbacks: match files even if renamed with a "(1)" suffix, a download hash prefix, etc.
+OLD_PATTERNS = ["*SCB_Cleaned_with_RBR*.xlsx", "*SCB_Cleaned*.xlsx"]
+NEW_PATTERNS = ["*Final_Cleaned*590*.xlsx", "*590*Removal*.xlsx", "*590*Dataset*.xlsx", "*590*.xlsx"]
 OUT = Path("SCB_Combined_Datasets_Outputs"); (OUT / "figures").mkdir(parents=True, exist_ok=True)
 np.random.seed(RANDOM_STATE)
 
 
-def resolve(cands):
+def resolve(cands, patterns=None):
+    # 1) exact candidate paths
     for p in cands:
-        if p.exists():
-            return p
+        try:
+            if p.exists():
+                return p
+        except Exception:
+            pass
+    # 2) fuzzy glob in the script folder, current working dir, and Downloads
+    if patterns:
+        search_dirs = []
+        try:
+            search_dirs.append(Path(__file__).resolve().parent)
+        except Exception:
+            pass
+        search_dirs += [Path.cwd(), Path.home() / "Downloads"]
+        seen = set()
+        for d in search_dirs:
+            if not d or str(d) in seen or not d.exists():
+                continue
+            seen.add(str(d))
+            for pat in patterns:
+                hits = sorted(d.glob(pat))
+                if hits:
+                    return hits[0]
     return None
 
 def read_best_sheet(path):
@@ -238,10 +262,17 @@ def parity(y, p, title, path):
 
 # =============================================================================
 def main():
-    old_p, new_p = resolve(OLD_CANDIDATES), resolve(NEW_CANDIDATES)
+    old_p, new_p = resolve(OLD_CANDIDATES, OLD_PATTERNS), resolve(NEW_CANDIDATES, NEW_PATTERNS)
     if old_p is None or new_p is None:
-        raise FileNotFoundError(f"Need both files. old={old_p} new={new_p}. "
-                                "Put SCB_Cleaned_with_RBR.xlsx and Final_Cleaned_590Dataset_User_Removal_Rules.xlsx next to the script.")
+        here = Path.cwd()
+        found = sorted(str(p.name) for p in here.glob("*.xlsx"))
+        raise FileNotFoundError(
+            f"Need both files. old={old_p} new={new_p}.\n"
+            f"  Working folder: {here}\n"
+            f"  .xlsx files I can see here: {found}\n"
+            "  Put BOTH files in this folder. The old one should contain 'SCB_Cleaned_with_RBR' in its "
+            "name; the new one should contain '590' in its name (a (1) suffix or extra prefix is fine).")
+    print(f"OLD file: {old_p}\nNEW file: {new_p}")
     old = harmonize(read_best_sheet(old_p), "old")
     new = harmonize(read_best_sheet(new_p), "new")
     print("=" * 92)
