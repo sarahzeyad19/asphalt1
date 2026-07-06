@@ -57,24 +57,53 @@ def _detect_device(pref="auto"):
     except Exception:
         return "cpu"
 
-TABPFN_KIND = None            # "auto" (post-hoc) or "plain" — set at import time below
+# ---- TabPFN backend ----
+# "client" = CLOUD API (easiest: pip install tabpfn-client; runs on Prior Labs servers, no local
+#            weights download). "local" = local weights (pip install tabpfn; needs the license).
+TABPFN_BACKEND = "client"
+# Paste your token here (from https://ux.priorlabs.ai/account, starts with tabpfn_sk_...). Leave
+# empty to instead read env var TABPFN_TOKEN, or (client) get an interactive login prompt.
+# SECURITY: do not commit a real token to git.
+TABPFN_API_TOKEN = r""
+
+import os as _os
 TabPFNRegressor = None
 AutoTabPFNRegressor = None
-try:
-    from tabpfn import TabPFNRegressor as _TabPFN
-    TabPFNRegressor = _TabPFN
-    TABPFN_KIND = "plain"
+_BACKEND = None
+
+def _apply_token():
+    tok = TABPFN_API_TOKEN or _os.environ.get("TABPFN_TOKEN", "")
+    return tok
+
+if TABPFN_BACKEND == "client":
     try:
-        # stronger post-hoc ensemble (pip install tabpfn-extensions). Import path may vary by version.
-        try:
-            from tabpfn_extensions.post_hoc_ensembles.sklearn_interface import AutoTabPFNRegressor as _Auto
-        except Exception:
-            from tabpfn_extensions import AutoTabPFNRegressor as _Auto
-        AutoTabPFNRegressor = _Auto
+        from tabpfn_client import TabPFNRegressor as _TabPFN, set_access_token as _set_tok
+        _tok = _apply_token()
+        if _tok:
+            try:
+                _set_tok(_tok)
+            except Exception as _e:
+                print(f"tabpfn_client token not set ({type(_e).__name__}); you may get a login prompt.")
+        TabPFNRegressor = _TabPFN
+        _BACKEND = "client"
     except Exception:
-        AutoTabPFNRegressor = None
-except Exception:
-    TabPFNRegressor = None
+        TabPFNRegressor = None
+
+if TabPFNRegressor is None:      # fall back to local weights
+    try:
+        from tabpfn import TabPFNRegressor as _TabPFN
+        TabPFNRegressor = _TabPFN
+        _BACKEND = "local"
+        try:
+            try:
+                from tabpfn_extensions.post_hoc_ensembles.sklearn_interface import AutoTabPFNRegressor as _Auto
+            except Exception:
+                from tabpfn_extensions import AutoTabPFNRegressor as _Auto
+            AutoTabPFNRegressor = _Auto
+        except Exception:
+            AutoTabPFNRegressor = None
+    except Exception:
+        TabPFNRegressor = None
 
 # =============================================================================
 # SETTINGS
@@ -88,6 +117,10 @@ USE_AUTO_TABPFN = True        # use AutoTabPFNRegressor (post-hoc) if tabpfn-ext
 AUTO_TABPFN_MAX_TIME = 120    # seconds budget for the post-hoc ensemble search
 REPEATED_K, REPEATED_REPEATS = 10, 3     # honest RepeatedCV (kept modest: TabPFN refits each fold)
 N_ITER_XGB = 60               # XGBoost RandomizedSearch budget (baseline)
+
+# The CLOUD client makes an API call per fit/predict, so heavy RepeatedCV can hit rate limits.
+# When True and the backend is "client", TabPFN uses a single light 5-fold CV instead of 10x3.
+TABPFN_CLIENT_LIGHT_CV = True
 
 OLD_FILE = r""                # paste full path to Rutting_Cleaned_with_RBR.xlsx if auto-find fails
 RUT_FEATURES = ["ADT_DOTD_ord", "PG Grade", "RAP_pct", "ACinRAP", "Pass_4.75mm", "Va", "VMA",
@@ -155,8 +188,19 @@ def num_pipe(est, feats):
                      ("sc", MinMaxScaler())]), feats)], remainder="drop")), ("model", est)])
 
 def build_tabpfn(feats):
-    """Return (pipeline, label) for the strongest available TabPFN: post-hoc AutoTabPFN if the
-    tabpfn-extensions package is present, else plain TabPFN with a larger internal ensemble."""
+    """Return (pipeline, label) for the strongest available TabPFN.
+    CLIENT (cloud) backend: TabPFNRegressor() runs on Prior Labs servers (no device arg).
+    LOCAL backend: post-hoc AutoTabPFN if tabpfn-extensions is present, else plain TabPFN with a
+    larger internal ensemble on the detected device."""
+    if _BACKEND == "client":
+        for kw in ({"n_estimators": TABPFN_ENSEMBLE}, {}):     # cloud may/ may not accept n_estimators
+            try:
+                lab = f"TabPFN-cloud(n_estimators={kw.get('n_estimators', 'def')})"
+                return num_pipe(TabPFNRegressor(**kw), feats), lab
+            except TypeError:
+                continue
+        return num_pipe(TabPFNRegressor(), feats), "TabPFN-cloud"
+    # local backend
     dev = _detect_device(TABPFN_DEVICE)
     if USE_AUTO_TABPFN and AutoTabPFNRegressor is not None:
         try:
@@ -206,8 +250,8 @@ def main():
         raise FileNotFoundError("Could not find Rutting_Cleaned_with_RBR.xlsx. Put it next to the script "
                                 "or paste its full path into OLD_FILE at the top.")
     print("=" * 92); print(f"RUT TabPFN | file: {old_p}")
-    print(f"TabPFN available: {TabPFNRegressor is not None} | AutoTabPFN: {AutoTabPFNRegressor is not None} | "
-          f"device={_detect_device(TABPFN_DEVICE)} | XGBoost={HAS_XGB}")
+    print(f"TabPFN available: {TabPFNRegressor is not None} | backend: {_BACKEND} | "
+          f"AutoTabPFN: {AutoTabPFNRegressor is not None} | device={_detect_device(TABPFN_DEVICE)} | XGBoost={HAS_XGB}")
     df = harmonize(read_best_sheet(old_p))
     df = df.loc[pd.to_numeric(df[TARGET], errors="coerce").notna()].reset_index(drop=True)
     y = pd.to_numeric(df[TARGET], errors="coerce")
@@ -230,7 +274,11 @@ def main():
             tp.fit(Xtr, ytr)
             p_te = tp.predict(Xte); preds["TabPFN"] = p_te
             tr_m, te_m = metrics(ytr, tp.predict(Xtr)), metrics(yte, p_te)
-            rc = repeated_cv(tp, Xtr, ytr)
+            if _BACKEND == "client" and TABPFN_CLIENT_LIGHT_CV:
+                print("  (cloud backend: using a light single 5-fold CV to limit API calls)")
+                rc = repeated_cv(tp, Xtr, ytr, k=CV_FOLDS, reps=1)
+            else:
+                rc = repeated_cv(tp, Xtr, ytr)
             rows.append({"Model": tp_label, "Train_R2": tr_m["R2"], "RepeatedCV_R2": rc["Mean"], "RepeatedCV_SD": rc["SD"],
                          "Test_R2": te_m["R2"], "Test_RMSE": te_m["RMSE"], "Overfit_Gap": tr_m["R2"] - rc["Mean"]})
             print(f"  {tp_label:26s} Train={tr_m['R2']:.3f} | RepeatedCV={rc['Mean']:.3f}±{rc['SD']:.3f} | Test={te_m['R2']:.3f}")
