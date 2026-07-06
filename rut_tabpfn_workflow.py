@@ -325,10 +325,18 @@ def main():
     print("\n" + "=" * 92); print("RESULTS (sorted by test R2):"); print(res.to_string(index=False)); print("=" * 92)
     print(f"\nBest test R2: {res['Test_R2'].max():.3f}  |  prior rutting locked test was ~0.58 (row-level).")
 
-    with pd.ExcelWriter(OUT / "Rut_TabPFN_Results.xlsx", engine="openpyxl") as w:
-        res.to_excel(w, sheet_name="Models", index=False)
-        pd.DataFrame({"Feature": feats}).to_excel(w, sheet_name="Features", index=False)
-    print(f"Saved: {OUT/'Rut_TabPFN_Results.xlsx'} | figures in {OUT/'figures'}")
+    # Robust save: some machines have a pandas/openpyxl mismatch (the 'autofilter' TypeError).
+    # Try Excel; if it fails, write CSVs so the run never crashes at the very end.
+    try:
+        with pd.ExcelWriter(OUT / "Rut_TabPFN_Results.xlsx", engine="openpyxl") as w:
+            res.to_excel(w, sheet_name="Models", index=False)
+            pd.DataFrame({"Feature": feats}).to_excel(w, sheet_name="Features", index=False)
+        print(f"Saved: {OUT/'Rut_TabPFN_Results.xlsx'} | figures in {OUT/'figures'}")
+    except Exception as e:
+        res.to_csv(OUT / "Rut_TabPFN_Results.csv", index=False)
+        pd.DataFrame({"Feature": feats}).to_csv(OUT / "Rut_TabPFN_Features.csv", index=False)
+        print(f"Excel save failed ({type(e).__name__}); wrote CSVs instead: {OUT/'Rut_TabPFN_Results.csv'}")
+        print("  Tip: fix Excel writing for all scripts with:  pip install --upgrade openpyxl")
 
 
 if __name__ == "__main__":
