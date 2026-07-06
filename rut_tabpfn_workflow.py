@@ -113,8 +113,10 @@ TARGET, UNITS = "Rut_20k", "mm"
 TEST_SIZE, CV_FOLDS = 0.25, 5
 TABPFN_ENSEMBLE = 32          # bigger internal ensemble = stronger TabPFN (default 8)
 TABPFN_DEVICE = "auto"        # "auto" -> cuda if available else cpu
-USE_AUTO_TABPFN = True        # use AutoTabPFNRegressor (post-hoc) if tabpfn-extensions is installed
-AUTO_TABPFN_MAX_TIME = 120    # seconds budget for the post-hoc ensemble search
+USE_AUTO_TABPFN = False       # post-hoc AutoTabPFN also needs 'pip install autogluon' (heavy); off by
+                              # default. If a real fit fails (e.g. missing autogluon) the code
+                              # automatically falls back to plain TabPFN, so it never gets skipped.
+AUTO_TABPFN_MAX_TIME = 120    # seconds budget for the post-hoc ensemble search (only if enabled)
 REPEATED_K, REPEATED_REPEATS = 10, 3     # honest RepeatedCV (kept modest: TabPFN refits each fold)
 N_ITER_XGB = 60               # XGBoost RandomizedSearch budget (baseline)
 
@@ -187,22 +189,21 @@ def num_pipe(est, feats):
     return Pipeline([("prep", ColumnTransformer([("num", Pipeline([("imp", SimpleImputer(strategy="median")),
                      ("sc", MinMaxScaler())]), feats)], remainder="drop")), ("model", est)])
 
-def build_tabpfn(feats):
+def build_tabpfn(feats, force_plain=False):
     """Return (pipeline, label) for the strongest available TabPFN.
     CLIENT (cloud) backend: TabPFNRegressor() runs on Prior Labs servers (no device arg).
-    LOCAL backend: post-hoc AutoTabPFN if tabpfn-extensions is present, else plain TabPFN with a
-    larger internal ensemble on the detected device."""
+    LOCAL backend: post-hoc AutoTabPFN if enabled/available, else plain TabPFN with a larger
+    internal ensemble. force_plain=True skips AutoTabPFN (used for the automatic fallback)."""
     if _BACKEND == "client":
-        for kw in ({"n_estimators": TABPFN_ENSEMBLE}, {}):     # cloud may/ may not accept n_estimators
+        for kw in ({"n_estimators": TABPFN_ENSEMBLE}, {}):     # cloud may/may not accept n_estimators
             try:
-                lab = f"TabPFN-cloud(n_estimators={kw.get('n_estimators', 'def')})"
-                return num_pipe(TabPFNRegressor(**kw), feats), lab
+                return num_pipe(TabPFNRegressor(**kw), feats), f"TabPFN-cloud(n_estimators={kw.get('n_estimators', 'def')})"
             except TypeError:
                 continue
         return num_pipe(TabPFNRegressor(), feats), "TabPFN-cloud"
     # local backend
     dev = _detect_device(TABPFN_DEVICE)
-    if USE_AUTO_TABPFN and AutoTabPFNRegressor is not None:
+    if USE_AUTO_TABPFN and AutoTabPFNRegressor is not None and not force_plain:
         try:
             return num_pipe(AutoTabPFNRegressor(max_time=AUTO_TABPFN_MAX_TIME, device=dev), feats), "AutoTabPFN(post-hoc)"
         except Exception:
@@ -270,8 +271,14 @@ def main():
     # ---- TabPFN (strong) ----
     if TabPFNRegressor is not None:
         try:
-            tp, tp_label = build_tabpfn(feats)
-            tp.fit(Xtr, ytr)
+            try:
+                tp, tp_label = build_tabpfn(feats)
+                tp.fit(Xtr, ytr)
+            except Exception as e_first:
+                # AutoTabPFN may need autogluon; fall back to plain TabPFN automatically
+                print(f"  ({type(e_first).__name__} on first TabPFN build: {str(e_first).splitlines()[0][:80]} -> falling back to plain TabPFN)")
+                tp, tp_label = build_tabpfn(feats, force_plain=True)
+                tp.fit(Xtr, ytr)
             p_te = tp.predict(Xte); preds["TabPFN"] = p_te
             tr_m, te_m = metrics(ytr, tp.predict(Xtr)), metrics(yte, p_te)
             if _BACKEND == "client" and TABPFN_CLIENT_LIGHT_CV:
@@ -285,8 +292,9 @@ def main():
             parity(yte, p_te, f"Rut test — {tp_label}", OUT / "figures" / "tabpfn_test_parity.png")
         except Exception as e:
             print(f"  TabPFN SKIPPED ({type(e).__name__}): {str(e).splitlines()[0]}")
-            print("  -> license needed: https://ux.priorlabs.ai (accept license), copy API key from /account,\n"
-                  "     then  setx TABPFN_TOKEN \"your-key\"  and restart Spyder.")
+            print("  -> EASIEST: use the cloud client. In Anaconda Prompt:  pip install tabpfn-client\n"
+                  "     then put TABPFN_BACKEND='client' and paste your token into TABPFN_API_TOKEN at the top.\n"
+                  "     Token: https://ux.priorlabs.ai/account  (accept the license first).")
     else:
         print("  TabPFN not installed -> pip install tabpfn (and optionally tabpfn-extensions).")
 
