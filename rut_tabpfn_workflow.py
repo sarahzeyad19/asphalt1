@@ -111,7 +111,8 @@ if TabPFNRegressor is None:      # fall back to local weights
 RANDOM_STATE = 42
 TARGET, UNITS = "Rut_20k", "mm"
 TEST_SIZE, CV_FOLDS = 0.25, 5
-TABPFN_ENSEMBLE = 32          # bigger internal ensemble = stronger TabPFN (default 8)
+TABPFN_ENSEMBLE = 8           # internal ensemble size. The CLOUD API maximum is 8 (n_estimators>8
+                              # returns HTTP 422), so the client backend clamps to 8. Local can go higher.
 TABPFN_DEVICE = "auto"        # "auto" -> cuda if available else cpu
 USE_AUTO_TABPFN = False       # post-hoc AutoTabPFN also needs 'pip install autogluon' (heavy); off by
                               # default. If a real fit fails (e.g. missing autogluon) the code
@@ -195,7 +196,8 @@ def build_tabpfn(feats, force_plain=False):
     LOCAL backend: post-hoc AutoTabPFN if enabled/available, else plain TabPFN with a larger
     internal ensemble. force_plain=True skips AutoTabPFN (used for the automatic fallback)."""
     if _BACKEND == "client":
-        for kw in ({"n_estimators": TABPFN_ENSEMBLE}, {}):     # cloud may/may not accept n_estimators
+        client_estimators = min(int(TABPFN_ENSEMBLE), 8)      # cloud API max is 8 (>8 -> HTTP 422)
+        for kw in ({"n_estimators": client_estimators}, {}):  # cloud may/may not accept n_estimators
             try:
                 return num_pipe(TabPFNRegressor(**kw), feats), f"TabPFN-cloud(n_estimators={kw.get('n_estimators', 'def')})"
             except TypeError:
