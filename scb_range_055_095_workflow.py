@@ -4,7 +4,12 @@ SCB RESTRICTED-RANGE PREDICTION WORKFLOW  (0.55 <= SCB <= 0.95)
 ==============================================================
 Complete, self-contained ML workflow for SCB (Jc) using SCB_Cleaned_with_RBR.xlsx, restricted to
 the physically-meaningful central range 0.55-0.95. Honest protocol: tune on 70% train, select on
-10% validation + repeated CV, score the 20% locked test once. TabPFN / AutoGluon added if installed.
+15% validation + repeated CV, score the 15% locked test once.
+
+Trains on UNIQUE mixes only (replicates collapsed by MixDesignKey before splitting -> no replicate
+leakage). Model roster: ExtraTrees, RandomForest, XGBoost, LightGBM, CatBoost, HistGradientBoosting,
+GradientBoostingHuber, NGBoost, Ridge, ElasticNet, HuberLinear, SVR-RBF, KNN, a Stacking ensemble,
+plus TabPFN and optional AutoGluon (added if installed).
 
 Implements the 18 requested functions:
  find_input_file, read_excel_best_sheet, standardize_column_names, add_engineering_features,
@@ -24,17 +29,19 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from sklearn.base import clone
+from sklearn.base import clone, BaseEstimator, RegressorMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import (ExtraTreesRegressor, RandomForestRegressor, HistGradientBoostingRegressor,
                               GradientBoostingRegressor, StackingRegressor)
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import RidgeCV
+from sklearn.linear_model import RidgeCV, Ridge, ElasticNet, HuberRegressor
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from sklearn.model_selection import (KFold, RepeatedKFold, StratifiedKFold, RandomizedSearchCV,
                                      train_test_split)
+from sklearn.neighbors import KNeighborsRegressor
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.svm import SVR
 
 try:
     from xgboost import XGBRegressor; HAS_XGB = True
@@ -63,6 +70,28 @@ if TabPFNRegressor is None:
 try:
     from autogluon.tabular import TabularPredictor; HAS_AUTOGLUON = True
 except Exception: HAS_AUTOGLUON = False
+try:
+    from ngboost import NGBRegressor; HAS_NGB = True
+except Exception: HAS_NGB = False
+
+
+class AutoGluonRegressor(BaseEstimator, RegressorMixin):
+    """Thin sklearn wrapper around AutoGluon TabularPredictor so it fits/predicts/clones like any
+    other estimator (works inside the pipeline, RepeatedCV and the locked-test path). AutoGluon does
+    its own preprocessing, so give it the raw numeric/categorical frame (no scaler needed)."""
+    def __init__(self, time_limit=120, presets="medium_quality", label="__y__"):
+        self.time_limit = time_limit; self.presets = presets; self.label = label
+    def fit(self, X, y):
+        import tempfile
+        from autogluon.tabular import TabularPredictor
+        Xy = pd.DataFrame(X).copy(); Xy[self.label] = np.asarray(y, float)
+        self._dir = tempfile.mkdtemp(prefix="ag_")
+        self.predictor_ = TabularPredictor(label=self.label, problem_type="regression",
+                                           eval_metric="r2", path=self._dir, verbosity=0)
+        self.predictor_.fit(Xy, time_limit=self.time_limit, presets=self.presets)
+        return self
+    def predict(self, X):
+        return np.asarray(self.predictor_.predict(pd.DataFrame(X)), float)
 
 # =============================================================================
 # CONFIG
@@ -248,9 +277,16 @@ def get_X(df, requested):
 
 
 # 10 =====================================================================
-def build_preprocessor(numerical, categorical) -> ColumnTransformer:
+def build_preprocessor(numerical, categorical, scale: bool = False) -> ColumnTransformer:
+    """Median-impute numerics (+ optional StandardScaler for linear/kernel/knn models),
+    one-hot encode categoricals. `scale=True` is required for Ridge/ElasticNet/SVR/KNN."""
     t = []
-    if numerical: t.append(("num", SimpleImputer(strategy="median"), numerical))
+    if numerical:
+        if scale:
+            num_pipe = Pipeline([("imp", SimpleImputer(strategy="median")), ("sc", StandardScaler())])
+            t.append(("num", num_pipe, numerical))
+        else:
+            t.append(("num", SimpleImputer(strategy="median"), numerical))
     if categorical:
         try: ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
         except TypeError: ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
@@ -297,11 +333,29 @@ def build_candidate_models(feature_set: str) -> dict:
         m["CatBoost"] = {"est": CatBoostRegressor(loss_function="RMSE", verbose=0, random_seed=RANDOM_STATE), "n_iter": N_ITER,
             "params": {"model__iterations": [500, 800], "model__learning_rate": [0.02, 0.03], "model__depth": [3, 4],
                        "model__l2_leaf_reg": [10, 20, 40], "model__subsample": [0.7, 0.85], "model__random_strength": [1.0, 2.0]}}
+    if HAS_NGB:
+        # NGBoost = probabilistic gradient boosting; shallow base learner, strong regularization.
+        m["NGBoost"] = {"est": NGBRegressor(random_state=RANDOM_STATE, verbose=False, natural_gradient=True), "n_iter": min(N_ITER, 12),
+            "params": {"model__n_estimators": [300, 500], "model__learning_rate": [0.01, 0.02, 0.03],
+                       "model__minibatch_frac": [0.7, 1.0], "model__col_sample": [0.7, 1.0]}}
+    # ---- Linear / kernel / neighbour baselines (need feature scaling) ----
+    m["Ridge"] = {"est": Ridge(random_state=RANDOM_STATE), "n_iter": N_ITER, "scale": True,
+        "params": {"model__alpha": [0.1, 1.0, 5.0, 10.0, 30.0, 100.0]}}
+    m["ElasticNet"] = {"est": ElasticNet(random_state=RANDOM_STATE, max_iter=10000), "n_iter": N_ITER, "scale": True,
+        "params": {"model__alpha": [0.001, 0.01, 0.05, 0.1, 0.5], "model__l1_ratio": [0.1, 0.3, 0.5, 0.7, 0.9]}}
+    m["HuberLinear"] = {"est": HuberRegressor(max_iter=10000), "n_iter": N_ITER, "scale": True,
+        "params": {"model__alpha": [0.0001, 0.001, 0.01, 0.1], "model__epsilon": [1.2, 1.35, 1.5]}}
+    m["SVR_RBF"] = {"est": SVR(kernel="rbf"), "n_iter": N_ITER, "scale": True,
+        "params": {"model__C": [1.0, 5.0, 10.0, 30.0], "model__gamma": ["scale", "auto", 0.05, 0.1],
+                   "model__epsilon": [0.01, 0.02, 0.05]}}
+    m["KNN"] = {"est": KNeighborsRegressor(), "n_iter": N_ITER, "scale": True,
+        "params": {"model__n_neighbors": [5, 8, 12, 20], "model__weights": ["uniform", "distance"],
+                   "model__p": [1, 2]}}
     return m
 
 
-def _pipe(est, numerical, categorical):
-    return Pipeline([("prep", build_preprocessor(numerical, categorical)), ("model", est)])
+def _pipe(est, numerical, categorical, scale: bool = False):
+    return Pipeline([("prep", build_preprocessor(numerical, categorical, scale=scale)), ("model", est)])
 
 def metrics(y, p):
     y, p = np.asarray(y, float), np.asarray(p, float)
@@ -318,7 +372,7 @@ def _save_df(df, path_xlsx):
 
 # 12 =====================================================================
 def tune_and_score_candidate(name, spec, Xtr, ytr, Xva, yva, numerical, categorical):
-    pipe = _pipe(clone(spec["est"]), numerical, categorical)
+    pipe = _pipe(clone(spec["est"]), numerical, categorical, scale=spec.get("scale", False))
     space = int(np.prod([len(v) for v in spec["params"].values()])) if spec["params"] else 1
     cv = StratifiedKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     bins = make_target_bins(ytr)
@@ -423,7 +477,15 @@ def write_summary_report(sel, leaderboard, robust, final_metrics, n_rows_range):
     lt = final_metrics.loc[final_metrics.Dataset == "LockedTest20"]
     lines = [
         "SCB RESTRICTED-RANGE (0.55–0.95) — SUMMARY REPORT", "=" * 60,
-        f"Rows used after range filter + unique-mix collapse: {n_rows_range}",
+        f"Rows used after range filter + unique-mix collapse: {n_rows_range} UNIQUE mixes",
+        "(Replicate rows sharing a MixDesignKey were collapsed BEFORE splitting, so no mix appears",
+        " in more than one of train/validation/test — this removes replicate leakage that would",
+        " otherwise inflate the scores.)",
+        "",
+        "Model roster: tree ensembles (ExtraTrees, RandomForest), boosting (XGBoost, LightGBM,",
+        "CatBoost, HistGradientBoosting, GradientBoostingHuber, NGBoost), linear/kernel/neighbour",
+        "baselines (Ridge, ElasticNet, HuberLinear, SVR-RBF, KNN), a Stacking ensemble, plus",
+        "TabPFN and optional AutoGluon AutoML.",
         "",
         "Engineering interpretation: SCB Jc measures cracking resistance (fracture energy). Values",
         "outside 0.55–0.95 are sparse tails; restricting to the dense central band gives a more",
@@ -473,8 +535,12 @@ def main():
     df = df.loc[pd.to_numeric(df[TARGET], errors="coerce").notna()].reset_index(drop=True)
     y = pd.to_numeric(df[TARGET], errors="coerce")
     df, y = filter_scb_range(df, y)
+    n_before_dedup = len(df)
     df = ensure_unique_mixes(df); y = pd.to_numeric(df[TARGET], errors="coerce")
-    n_rows_range = len(df); print(f"Final modelling rows: {n_rows_range}"); print("=" * 92)
+    n_rows_range = len(df)
+    print(f"UNIQUE-MIX DATA: modelling on {n_rows_range} unique mixes "
+          f"(collapsed {n_before_dedup - n_rows_range} replicate rows -> no replicate leakage across splits).")
+    print(f"Final modelling rows: {n_rows_range}"); print("=" * 92)
 
     tr, va, te = split_70_10_20(df, y)
     feature_sets = build_feature_sets()
@@ -518,6 +584,24 @@ def main():
         except Exception as e:
             print(f"  TabPFN skipped: {type(e).__name__}: {str(e).splitlines()[0]}")
 
+    # ---- AutoGluon (no-tune AutoML candidate) on the primary feature set ----
+    if RUN_AUTOGLUON and HAS_AUTOGLUON:
+        try:
+            X, num, cat, avail = get_X(df, feature_sets[primary_fs])
+            Xtr = X.iloc[tr].reset_index(drop=True); Xva = X.iloc[va].reset_index(drop=True); Xte = X.iloc[te].reset_index(drop=True)
+            ytr = y.iloc[tr].reset_index(drop=True); yva = y.iloc[va].reset_index(drop=True); yte = y.iloc[te].reset_index(drop=True)
+            ag = AutoGluonRegressor(time_limit=180, presets="good_quality")
+            ag.fit(Xtr, ytr)
+            va_m = metrics(yva, ag.predict(Xva)); tr_m = metrics(ytr, ag.predict(Xtr))
+            lbl = f"{primary_fs} | AutoGluon"
+            leaderboard_rows.append({"Model": "AutoGluon", "Feature_Set": primary_fs, "Label": lbl,
+                "Train_R2": tr_m["R2"], "OOF_CV_R2": np.nan, "Validation_R2": va_m["R2"], "Validation_RMSE": va_m["RMSE"],
+                "Validation_MAE": va_m["MAE"], "Train_minus_Val_gap": tr_m["R2"] - va_m["R2"], "Best_Params": "automl"})
+            trained[lbl] = {"est": ag, "num": num, "cat": cat, "Xtr": Xtr, "ytr": ytr, "Xva": Xva, "yva": yva, "Xte": Xte, "yte": yte, "feats": avail}
+            print(f"  AutoGluon Val R2={va_m['R2']:.4f}")
+        except Exception as e:
+            print(f"  AutoGluon skipped: {type(e).__name__}: {str(e).splitlines()[0]}")
+
     leaderboard = pd.DataFrame(leaderboard_rows)
     if leaderboard.empty: raise RuntimeError("No candidate models finished.")
 
@@ -529,7 +613,8 @@ def main():
     # ---- Repeated CV on the best instance per family (primary feature set) ----
     print("\nRepeated CV on best candidates (development set, no test leakage)...")
     rcv_models = {}
-    for fam in ["ExtraTrees", "RandomForest", "XGBoost", "LightGBM", "CatBoost", "HistGradientBoosting", "GradientBoostingHuber"]:
+    for fam in ["ExtraTrees", "RandomForest", "XGBoost", "LightGBM", "CatBoost", "HistGradientBoosting",
+                "GradientBoostingHuber", "NGBoost", "Ridge", "ElasticNet", "HuberLinear", "SVR_RBF", "KNN"]:
         cands = leaderboard[(leaderboard.Model == fam)].sort_values("Validation_R2", ascending=False)
         if cands.empty: continue
         lbl = cands.iloc[0]["Label"]; obj = trained.get(lbl)
