@@ -70,7 +70,7 @@ except Exception: HAS_AUTOGLUON = False
 RANDOM_STATE = 42
 TARGET = "SCB"; UNITS = "kJ/m2"; ID_COL = "MixDesignKey"
 SCB_LOW, SCB_HIGH = 0.55, 0.95
-TRAIN, VAL, TEST = 0.70, 0.10, 0.20
+TRAIN, VAL, TEST = 0.70, 0.15, 0.15
 CV_FOLDS, N_TARGET_BINS = 5, 5
 N_ITER = 40
 REPEATED_REPEATS = 5
@@ -214,7 +214,8 @@ def split_70_10_20(df: pd.DataFrame, y: pd.Series):
         g = df[ID_COL].astype(str).values
         leak = (len(set(g[tr]) & set(g[test_idx])) + len(set(g[va]) & set(g[test_idx])) + len(set(g[tr]) & set(g[va])))
         print(f"split_70_10_20: train {len(tr)} / val {len(va)} / locked-test {len(test_idx)} | mix overlap across splits = {leak} (must be 0)")
-    for name, ix in [("train_70", tr), ("validation_10", va), ("locked_test_20_DO_NOT_TUNE", test_idx)]:
+    for name, ix in [(f"train_{int(TRAIN*100)}", tr), (f"validation_{int(VAL*100)}", va),
+                     (f"locked_test_{int(TEST*100)}_DO_NOT_TUNE", test_idx)]:
         _save_df(df.iloc[ix], OUT / "splits" / f"{name}.xlsx")
     return np.array(tr), np.array(va), np.array(test_idx)
 
@@ -259,30 +260,43 @@ def build_preprocessor(numerical, categorical) -> ColumnTransformer:
 
 # 11 =====================================================================
 def build_candidate_models(feature_set: str) -> dict:
+    # STRONGLY REGULARIZED grids to shrink the train-validation gap (anti-overfitting):
+    # trees are capped SHALLOW, leaves must hold MANY samples, subsampling + high L1/L2 are used.
     m = {}
-    m["ExtraTrees"] = {"est": ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=-1), "n_iter": N_ITER,
-        "params": {"model__n_estimators": [300, 600, 900], "model__max_depth": [None, 8, 16],
-                   "model__min_samples_leaf": [1, 3, 8, 12], "model__max_features": ["sqrt", 0.5, 0.8]}}
+    # Moderate regularization: caps depth and enforces a leaf floor (removes the overfitting
+    # depth=None / leaf=1 options) but leaves the CV room to pick a good bias-variance balance.
+    m["ExtraTrees"] = {"est": ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=-1, bootstrap=True), "n_iter": N_ITER,
+        "params": {"model__n_estimators": [400, 700], "model__max_depth": [6, 8, 12],
+                   "model__min_samples_leaf": [5, 8, 12, 20], "model__min_samples_split": [10, 20],
+                   "model__max_features": ["sqrt", 0.5, 0.7], "model__max_samples": [0.7, 0.9]}}
     m["RandomForest"] = {"est": RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1), "n_iter": N_ITER,
-        "params": {"model__n_estimators": [300, 600], "model__max_depth": [None, 8, 16],
-                   "model__min_samples_leaf": [1, 3, 8, 12], "model__max_features": ["sqrt", 0.5, 0.8]}}
-    m["HistGradientBoosting"] = {"est": HistGradientBoostingRegressor(random_state=RANDOM_STATE, loss="squared_error"), "n_iter": N_ITER,
-        "params": {"model__learning_rate": [0.02, 0.05, 0.08], "model__max_iter": [300, 600],
-                   "model__max_leaf_nodes": [8, 15, 31], "model__min_samples_leaf": [15, 30], "model__l2_regularization": [0.0, 1.0, 5.0]}}
+        "params": {"model__n_estimators": [400, 700], "model__max_depth": [6, 8, 12],
+                   "model__min_samples_leaf": [5, 8, 12, 20], "model__min_samples_split": [10, 20],
+                   "model__max_features": ["sqrt", 0.5, 0.7], "model__max_samples": [0.7, 0.9]}}
+    m["HistGradientBoosting"] = {"est": HistGradientBoostingRegressor(random_state=RANDOM_STATE, loss="squared_error",
+                                     early_stopping=True, validation_fraction=0.15, n_iter_no_change=25), "n_iter": N_ITER,
+        "params": {"model__learning_rate": [0.02, 0.04], "model__max_iter": [400, 800],
+                   "model__max_leaf_nodes": [8, 15], "model__min_samples_leaf": [25, 40, 60],   # bigger leaves
+                   "model__l2_regularization": [1.0, 5.0, 20.0], "model__max_depth": [2, 3]}}
     m["GradientBoostingHuber"] = {"est": GradientBoostingRegressor(random_state=RANDOM_STATE, loss="huber"), "n_iter": N_ITER,
-        "params": {"model__n_estimators": [300, 500], "model__learning_rate": [0.02, 0.05], "model__max_depth": [2, 3], "model__subsample": [0.7, 0.9]}}
+        "params": {"model__n_estimators": [300, 500], "model__learning_rate": [0.02, 0.04], "model__max_depth": [2, 3],
+                   "model__min_samples_leaf": [15, 30], "model__subsample": [0.7, 0.85], "model__max_features": [0.5, 0.8]}}
     if HAS_XGB:
         m["XGBoost"] = {"est": XGBRegressor(objective="reg:squarederror", tree_method="hist", random_state=RANDOM_STATE, n_jobs=-1), "n_iter": N_ITER,
-            "params": {"model__n_estimators": [400, 800], "model__max_depth": [2, 3, 4], "model__learning_rate": [0.02, 0.05],
-                       "model__subsample": [0.6, 0.8], "model__colsample_bytree": [0.6, 0.8], "model__min_child_weight": [5, 12],
-                       "model__reg_lambda": [2, 10, 40], "model__gamma": [0.0, 0.1]}}
+            "params": {"model__n_estimators": [500, 900], "model__max_depth": [2, 3], "model__learning_rate": [0.01, 0.02, 0.03],
+                       "model__subsample": [0.6, 0.7, 0.8], "model__colsample_bytree": [0.5, 0.6, 0.7],
+                       "model__min_child_weight": [10, 20, 30], "model__reg_alpha": [0.5, 1.0, 2.0],
+                       "model__reg_lambda": [10, 30, 60], "model__gamma": [0.1, 0.2, 0.3]}}
     if HAS_LGBM:
         m["LightGBM"] = {"est": LGBMRegressor(random_state=RANDOM_STATE, n_jobs=-1, verbose=-1), "n_iter": N_ITER,
-            "params": {"model__n_estimators": [400, 800], "model__num_leaves": [7, 15, 31], "model__learning_rate": [0.02, 0.05],
-                       "model__min_child_samples": [20, 40], "model__subsample": [0.8], "model__reg_lambda": [5, 20]}}
+            "params": {"model__n_estimators": [500, 900], "model__num_leaves": [7, 15], "model__max_depth": [3, 4],
+                       "model__learning_rate": [0.01, 0.02, 0.03], "model__min_child_samples": [30, 50, 80],
+                       "model__subsample": [0.7, 0.8], "model__colsample_bytree": [0.6, 0.8],
+                       "model__reg_alpha": [0.5, 1.0], "model__reg_lambda": [10, 30, 60]}}
     if HAS_CAT:
         m["CatBoost"] = {"est": CatBoostRegressor(loss_function="RMSE", verbose=0, random_seed=RANDOM_STATE), "n_iter": N_ITER,
-            "params": {"model__iterations": [500, 800], "model__learning_rate": [0.02, 0.05], "model__depth": [3, 4, 6], "model__l2_leaf_reg": [5, 20]}}
+            "params": {"model__iterations": [500, 800], "model__learning_rate": [0.02, 0.03], "model__depth": [3, 4],
+                       "model__l2_leaf_reg": [10, 20, 40], "model__subsample": [0.7, 0.85], "model__random_strength": [1.0, 2.0]}}
     return m
 
 
