@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-SCB ENHANCED WORKFLOW — NEW DATA FILE (new_data_._SCB_LWT.xlsx, Sheet1)
+SCB ENHANCED WORKFLOW — CLEANED DATA FILE (New_Data_SCB_LWT_Cleaned_Modeling_Files.xlsx,
+sheet SCB_Clean_Modeling, 760 rows)
 =======================================================================
+Data notes (from the file's own Feature_Removal_Log): Pass4_75mm/Pass0_075mm are replaced by
+Grad_No4/Grad_No200; Pba_pct and Gmb_specimen_AC are removed; additive columns are the cleaned
+Additive_Type_clean/Additive_Rate_clean; RBR_percent is shipped directly. FLAG_* columns are
+row-quality flags and are NEVER used as predictors.
+
 Mirrors the code that got the HIGH SCB result (validation ~0.68: tuned ExtraTrees on the full
 range, 70/10/20 stratified split) and ENHANCES it with the NEW calculated features shipped in
 the updated data file:
@@ -40,8 +46,8 @@ from sklearn.preprocessing import OneHotEncoder
 # =============================================================================
 RANDOM_STATE = 42
 TARGET = "SCB"; ID_COL = "MixDesignKey"
-SHEET = "Sheet1"                     # SCB lives in Sheet1 of the new file
-FILE_NAME = "new_data_._SCB_LWT.xlsx"
+SHEET = "SCB_Clean_Modeling"         # cleaned SCB modeling sheet
+FILE_NAME = "New_Data_SCB_LWT_Cleaned_Modeling_Files.xlsx"
 TRAIN, VAL, TEST = 0.70, 0.10, 0.20  # the split that produced the 0.68 result
 CV_FOLDS, N_TARGET_BINS = 5, 5
 N_ITER = 80                          # ExtraTrees tuning budget (the winner model)
@@ -55,18 +61,19 @@ np.random.seed(RANDOM_STATE)
 # =============================================================================
 # FEATURES: old winner set + the NEW calculated features (chosen by their effect on SCB)
 # =============================================================================
-OLD_WINNER = ["ACinRAP", "PG_HighTemp", "SandEq", "Dust_Binder", "VFA", "Pass4_75mm", "FAA",
+# Pass4_75mm -> Grad_No4 and Pass0_075mm -> Grad_No200 (same sieves; per Feature_Removal_Log)
+OLD_WINNER = ["ACinRAP", "PG_HighTemp", "SandEq", "Dust_Binder", "VFA", "Grad_No4", "FAA",
               "Absorption", "VMA", "AsphaltContent_Design", "RAP_pct_x_ACinRAP",
-              "NMAS (mm)", "Pass0_075mm", "Va", "Gmm", "CAA", "RBR_JMF_fraction"]
-NEW_SCB = ["AFT_micron", "Additive_Rate", "Pbe_pct", "Dust_Pbe_ratio", "Gse",
-           "Gmb_specimen_AC", "Grad_No8", "Grad_No50", "Grad_No100", "SurfaceArea_m2kg"]
-CATEGORICAL_HINTS = ["MixType", "DesignLev", "RAP_Class", "Additive_Type", "Has_Additive"]
+              "NMAS (mm)", "Grad_No200", "Va", "Gmm", "CAA", "RBR_JMF_fraction"]
+NEW_SCB = ["AFT_micron", "Additive_Rate_clean", "Pbe_pct", "Dust_Pbe_ratio", "Gse",
+           "Grad_No8", "Grad_No50", "Grad_No100", "SurfaceArea_m2kg", "MixTemperature_F_clean"]
+CATEGORICAL_HINTS = ["MixType", "DesignLev", "Additive_Type_clean", "Has_Additive"]
 
 def build_feature_sets() -> dict:
     return {
         "Winner_OldFeatures": OLD_WINNER,                                  # baseline = the 0.68 set
         "Winner_PlusNewFeatures": OLD_WINNER + NEW_SCB,                    # the enhancement
-        "PlusNew_WithAdditiveType": OLD_WINNER + NEW_SCB + ["Additive_Type", "Has_Additive"],
+        "PlusNew_WithAdditiveType": OLD_WINNER + NEW_SCB + ["Additive_Type_clean", "Has_Additive"],
     }
 
 # =============================================================================
@@ -81,7 +88,9 @@ def find_input_file() -> Path:
     for d in [Path.cwd(), home / "Downloads", home / "Desktop", home / "OneDrive" / "Desktop",
               Path("/content"), Path("/root/.claude/uploads")]:
         if d.exists():
-            for pat in ["*new_data*SCB_LWT*.xlsx", "*SCB_LWT*.xlsx"]:
+            # also matches copies like "New_Data_SCB_LWT_Cleaned_Modeling_Files (1).xlsx"
+            for pat in ["*New_Data*SCB_LWT*Cleaned*Modeling*.xlsx", "*New_Data_SCB_LWT*.xlsx",
+                        "*SCB_LWT*Cleaned*.xlsx"]:
                 hits = sorted(d.glob(pat)) or sorted(d.rglob(pat))
                 if hits: return hits[0]
     raise FileNotFoundError(f"Put {FILE_NAME} next to this script or in Downloads.")
@@ -101,7 +110,10 @@ def load_data() -> tuple:
         if c in df.columns: df[c] = pd.to_numeric(df[c], errors="coerce")
     if {"RAP_pct", "ACinRAP"}.issubset(df.columns):
         df["RAP_pct_x_ACinRAP"] = df["RAP_pct"] * df["ACinRAP"]
-    if {"RAP_pct", "ACinRAP", "AsphaltContent_Design"}.issubset(df.columns):
+    # RBR: prefer the file's own RBR_percent; recompute only if it is absent
+    if "RBR_percent" in df.columns:
+        df["RBR_JMF_fraction"] = pd.to_numeric(df["RBR_percent"], errors="coerce") / 100.0
+    elif {"RAP_pct", "ACinRAP", "AsphaltContent_Design"}.issubset(df.columns):
         df["RBR_JMF_fraction"] = _safe_div(df["RAP_pct"] * df["ACinRAP"] / 100.0, df["AsphaltContent_Design"])
     df = df.loc[pd.to_numeric(df[TARGET], errors="coerce").notna()].reset_index(drop=True)
     if UNIQUE_MIXES and ID_COL in df.columns and df[ID_COL].nunique() < len(df):
