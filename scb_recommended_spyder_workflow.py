@@ -35,7 +35,8 @@ from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.inspection import PartialDependenceDisplay, permutation_importance
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-from sklearn.model_selection import KFold, StratifiedKFold, RandomizedSearchCV, train_test_split
+from sklearn.model_selection import (KFold, StratifiedKFold, StratifiedGroupKFold,
+                                     RandomizedSearchCV, train_test_split)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
@@ -56,7 +57,9 @@ TRAIN, VAL, TEST = 0.70, 0.10, 0.20
 CV_FOLDS, N_TARGET_BINS = 5, 5
 N_ITER = 80
 REPEATED_REPEATS = 5
-UNIQUE_MIXES = True
+# Use ALL test rows (replicates kept). Leakage is prevented by the GROUP-aware split below:
+# every replicate of a mix goes to the SAME split, so no mix straddles train/val/test.
+UNIQUE_MIXES = False
 SHOW_PLOTS = True                 # True = show every figure in Spyder (they are ALSO saved)
 MAX_SHAP_ROWS = 500
 OUT = Path("SCB_Recommended_SHAP_PDP_outputs")
@@ -174,17 +177,33 @@ def make_target_bins(y, n_bins=N_TARGET_BINS):
         except Exception: continue
     return (y >= y.median()).astype(int)
 
+def _group_holdout(bins, groups, holdout_size, seed):
+    """Target-stratified holdout that keeps every replicate of a mix together."""
+    n_splits = max(2, int(round(1.0 / holdout_size)))
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    keep, hold = next(iter(sgkf.split(np.zeros(len(bins)), bins, groups)))
+    return np.array(keep), np.array(hold)
+
 def split_70_10_20(df, y):
     bins = make_target_bins(y); idx = np.arange(len(y))
-    dev, te = train_test_split(idx, test_size=TEST, random_state=RANDOM_STATE, shuffle=True, stratify=bins)
-    vfrac = VAL / (TRAIN + VAL)
-    trp, vap = train_test_split(np.arange(len(dev)), test_size=vfrac, random_state=RANDOM_STATE,
-                                shuffle=True, stratify=bins.iloc[dev].reset_index(drop=True))
-    tr, va = dev[trp], dev[vap]
-    if ID_COL in df.columns:
-        g = df[ID_COL].astype(str).values
+    groups = df[ID_COL].astype(str).values if ID_COL in df.columns else None
+    if groups is not None and len(set(groups)) < len(groups):
+        # ALL rows kept -> GROUP-aware split so replicates never straddle splits
+        dev, te = _group_holdout(bins, groups, TEST, RANDOM_STATE)
+        vfrac = VAL / (TRAIN + VAL)
+        trp, vap = _group_holdout(bins.iloc[dev].reset_index(drop=True), groups[dev], vfrac, RANDOM_STATE)
+        tr, va = dev[trp], dev[vap]
+    else:
+        dev, te = train_test_split(idx, test_size=TEST, random_state=RANDOM_STATE, shuffle=True, stratify=bins)
+        vfrac = VAL / (TRAIN + VAL)
+        trp, vap = train_test_split(np.arange(len(dev)), test_size=vfrac, random_state=RANDOM_STATE,
+                                    shuffle=True, stratify=bins.iloc[dev].reset_index(drop=True))
+        tr, va = dev[trp], dev[vap]
+    if groups is not None:
+        g = groups
         leak = len(set(g[tr]) & set(g[te])) + len(set(g[va]) & set(g[te])) + len(set(g[tr]) & set(g[va]))
-        print(f"Split: train {len(tr)} / val {len(va)} / locked-test {len(te)} | mix overlap = {leak} (must be 0)")
+        print(f"Split: train {len(tr)} / val {len(va)} / locked-test {len(te)} rows | mix overlap = {leak} (must be 0)")
+        print(f"       mixes: train {len(set(g[tr]))} / val {len(set(g[va]))} / test {len(set(g[te]))}")
     for name, ix in [("train_70", tr), ("validation_10", va), ("locked_test_20_DO_NOT_TUNE", te)]:
         _save_df(df.iloc[ix], OUT / "splits" / f"{name}.xlsx")
     return tr, va, te
@@ -245,13 +264,20 @@ RF_GRID = {"model__n_estimators": [400, 800],
            "model__min_samples_leaf": [1, 2, 4],
            "model__max_features": ["sqrt", 0.5, 0.7]}
 
-def tune(name, est, grid, n_iter, Xtr, ytr, Xva, yva, num, cat):
+def _train_cv_splits(ytr, gtr):
+    """Group-aware CV inside training when replicates exist (keeps a mix in one fold)."""
+    bins = make_target_bins(ytr)
+    if gtr is not None and len(set(gtr)) < len(gtr):
+        cv = StratifiedGroupKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+        return list(cv.split(np.zeros(len(ytr)), bins, gtr))
+    cv = StratifiedKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    return list(cv.split(np.zeros(len(ytr)), bins))
+
+def tune(name, est, grid, n_iter, Xtr, ytr, Xva, yva, num, cat, gtr=None):
     pipe = _pipe(clone(est), num, cat)
     space = int(np.prod([len(v) for v in grid.values()]))
-    cv = StratifiedKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    bins = make_target_bins(ytr)
     s = RandomizedSearchCV(pipe, grid, n_iter=min(n_iter, space), scoring="r2",
-                           cv=list(cv.split(np.zeros(len(ytr)), bins)), random_state=RANDOM_STATE,
+                           cv=_train_cv_splits(ytr, gtr), random_state=RANDOM_STATE,
                            n_jobs=1, return_train_score=True, error_score=np.nan)
     s.fit(Xtr, ytr)
     best = s.best_estimator_
@@ -262,11 +288,21 @@ def tune(name, est, grid, n_iter, Xtr, ytr, Xva, yva, num, cat):
            "Train_minus_Val_gap": trm["R2"] - vam["R2"], "Best_Params": json.dumps(s.best_params_, default=str)}
     return row, best
 
-def repeated_cv(est, Xdev, ydev):
+def repeated_cv(est, Xdev, ydev, gdev=None):
+    """Repeated CV; GROUP-aware when replicates exist (each repeat randomly re-assigns whole
+    mixes to folds, so replicates of a mix are never split between train and validation)."""
     sc = []
     for r in range(REPEATED_REPEATS):
-        cv = KFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE + 59 * r)
-        for tr, va in cv.split(Xdev):
+        if gdev is not None and len(set(gdev)) < len(gdev):
+            rng = np.random.RandomState(RANDOM_STATE + 59 * r)
+            ug = np.unique(gdev); fold_of = dict(zip(ug, rng.randint(0, CV_FOLDS, size=len(ug))))
+            f = np.array([fold_of[g] for g in gdev])
+            splits = [(np.where(f != k)[0], np.where(f == k)[0]) for k in range(CV_FOLDS)]
+        else:
+            cv = KFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE + 59 * r)
+            splits = list(cv.split(Xdev))
+        for tr, va in splits:
+            if len(va) == 0 or len(tr) == 0: continue
             e = clone(est); e.fit(Xdev.iloc[tr], ydev.iloc[tr])
             sc.append(r2_score(ydev.iloc[va], e.predict(Xdev.iloc[va])))
     sc = np.array(sc)
@@ -346,6 +382,9 @@ def run_pdp(final_pipe, Xdev, ydev, num_features):
 def main():
     df, y = load_data()
     tr, va, te = split_70_10_20(df, y)
+    groups = df[ID_COL].astype(str).values if ID_COL in df.columns else None
+    gtr = groups[tr] if groups is not None else None
+    gdev = groups[np.concatenate([tr, va])] if groups is not None else None
     rows, trained = [], {}
 
     for fs_name, feats in build_feature_sets().items():
@@ -357,7 +396,7 @@ def main():
         for mname, est, grid, ni in [("ExtraTrees", ExtraTreesRegressor(random_state=RANDOM_STATE, n_jobs=-1), ET_GRID, N_ITER),
                                      ("RandomForest", RandomForestRegressor(random_state=RANDOM_STATE, n_jobs=-1), RF_GRID, max(20, N_ITER // 2))]:
             try:
-                row, best = tune(mname, est, grid, ni, Xtr, ytr, Xva, yva, num, cat)
+                row, best = tune(mname, est, grid, ni, Xtr, ytr, Xva, yva, num, cat, gtr=gtr)
                 row["Feature_Set"] = fs_name; row["Label"] = f"{fs_name} | {mname}"
                 rows.append(row)
                 trained[row["Label"]] = {"est": best, "Xtr": Xtr, "ytr": ytr, "Xva": Xva, "yva": yva,
@@ -379,7 +418,7 @@ def main():
         obj = trained[lbl]
         Xdev = pd.concat([obj["Xtr"], obj["Xva"]]).reset_index(drop=True)
         ydev = pd.concat([obj["ytr"], obj["yva"]]).reset_index(drop=True)
-        m, s, mn = repeated_cv(obj["est"], Xdev, ydev)
+        m, s, mn = repeated_cv(obj["est"], Xdev, ydev, gdev=gdev)
         rcv_rows.append({"Label": lbl, "RepeatedCV_R2_mean": m, "RepeatedCV_R2_std": s, "RepeatedCV_R2_min": mn})
         print(f"  {lbl:45s} {m:.4f} +/- {s:.4f} (min {mn:.4f})")
     rcv = pd.DataFrame(rcv_rows).sort_values("RepeatedCV_R2_mean", ascending=False).reset_index(drop=True)

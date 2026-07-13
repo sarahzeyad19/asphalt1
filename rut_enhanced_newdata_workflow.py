@@ -38,7 +38,8 @@ from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
-from sklearn.model_selection import KFold, StratifiedKFold, RandomizedSearchCV, train_test_split
+from sklearn.model_selection import (KFold, StratifiedKFold, StratifiedGroupKFold,
+                                     RandomizedSearchCV, train_test_split)
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
@@ -73,7 +74,9 @@ TRAIN, VAL, TEST = 0.70, 0.10, 0.20
 CV_FOLDS, N_TARGET_BINS = 5, 5
 N_ITER_XGB = 120                     # the winner's tuning budget style
 REPEATED_REPEATS = 5
-UNIQUE_MIXES = True                  # collapse replicates by MixDesignKey (no replicate leakage)
+# Use ALL test rows (replicates kept). Leakage is prevented by the GROUP-aware split below:
+# every replicate of a mix goes to the SAME split, so no mix straddles train/val/test.
+UNIQUE_MIXES = False
 OUT = Path("Rut_Enhanced_NewData_outputs")
 for sub in ["", "figures", "splits", "models"]:
     (OUT / sub).mkdir(parents=True, exist_ok=True)
@@ -161,17 +164,33 @@ def make_target_bins(y, n_bins=N_TARGET_BINS):
         except Exception: continue
     return (y >= y.median()).astype(int)
 
+def _group_holdout(bins, groups, holdout_size, seed):
+    """Target-stratified holdout that keeps every replicate of a mix together."""
+    n_splits = max(2, int(round(1.0 / holdout_size)))
+    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    keep, hold = next(iter(sgkf.split(np.zeros(len(bins)), bins, groups)))
+    return np.array(keep), np.array(hold)
+
 def split_70_10_20(df, y):
     bins = make_target_bins(y); idx = np.arange(len(y))
-    dev, te = train_test_split(idx, test_size=TEST, random_state=RANDOM_STATE, shuffle=True, stratify=bins)
-    vfrac = VAL / (TRAIN + VAL)
-    trp, vap = train_test_split(np.arange(len(dev)), test_size=vfrac, random_state=RANDOM_STATE,
-                                shuffle=True, stratify=bins.iloc[dev].reset_index(drop=True))
-    tr, va = dev[trp], dev[vap]
-    if ID_COL in df.columns:
-        g = df[ID_COL].astype(str).values
+    groups = df[ID_COL].astype(str).values if ID_COL in df.columns else None
+    if groups is not None and len(set(groups)) < len(groups):
+        # ALL rows kept -> GROUP-aware split so replicates never straddle splits
+        dev, te = _group_holdout(bins, groups, TEST, RANDOM_STATE)
+        vfrac = VAL / (TRAIN + VAL)
+        trp, vap = _group_holdout(bins.iloc[dev].reset_index(drop=True), groups[dev], vfrac, RANDOM_STATE)
+        tr, va = dev[trp], dev[vap]
+    else:
+        dev, te = train_test_split(idx, test_size=TEST, random_state=RANDOM_STATE, shuffle=True, stratify=bins)
+        vfrac = VAL / (TRAIN + VAL)
+        trp, vap = train_test_split(np.arange(len(dev)), test_size=vfrac, random_state=RANDOM_STATE,
+                                    shuffle=True, stratify=bins.iloc[dev].reset_index(drop=True))
+        tr, va = dev[trp], dev[vap]
+    if groups is not None:
+        g = groups
         leak = len(set(g[tr]) & set(g[te])) + len(set(g[va]) & set(g[te])) + len(set(g[tr]) & set(g[va]))
-        print(f"Split: train {len(tr)} / val {len(va)} / locked-test {len(te)} | mix overlap = {leak} (must be 0)")
+        print(f"Split: train {len(tr)} / val {len(va)} / locked-test {len(te)} rows | mix overlap = {leak} (must be 0)")
+        print(f"       mixes: train {len(set(g[tr]))} / val {len(set(g[va]))} / test {len(set(g[te]))}")
     for name, ix in [("train_70", tr), ("validation_10", va), ("locked_test_20_DO_NOT_TUNE", te)]:
         _save_df(df.iloc[ix], OUT / "splits" / f"{name}.xlsx")
     return tr, va, te
@@ -219,14 +238,21 @@ XGB_GRID = {"model__n_estimators": [500, 900, 1400], "model__max_depth": [2, 3, 
             "model__min_child_weight": [5, 10, 20], "model__reg_alpha": [0.1, 0.5, 1.0, 2.0],
             "model__reg_lambda": [5, 10, 30, 60], "model__gamma": [0.0, 0.1, 0.2]}
 
-def tune_xgb(Xtr, ytr, Xva, yva, num, cat):
+def _train_cv_splits(ytr, gtr):
+    """Group-aware CV inside training when replicates exist (keeps a mix in one fold)."""
+    bins = make_target_bins(ytr)
+    if gtr is not None and len(set(gtr)) < len(gtr):
+        cv = StratifiedGroupKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+        return list(cv.split(np.zeros(len(ytr)), bins, gtr))
+    cv = StratifiedKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    return list(cv.split(np.zeros(len(ytr)), bins))
+
+def tune_xgb(Xtr, ytr, Xva, yva, num, cat, gtr=None):
     est = XGBRegressor(objective="reg:squarederror", tree_method="hist",
                        random_state=RANDOM_STATE, n_jobs=-1)
     pipe = _pipe(est, num, cat)
-    cv = StratifiedKFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
-    bins = make_target_bins(ytr)
     s = RandomizedSearchCV(pipe, XGB_GRID, n_iter=N_ITER_XGB, scoring="r2",
-                           cv=list(cv.split(np.zeros(len(ytr)), bins)), random_state=RANDOM_STATE,
+                           cv=_train_cv_splits(ytr, gtr), random_state=RANDOM_STATE,
                            n_jobs=1, return_train_score=True, error_score=np.nan)
     s.fit(Xtr, ytr)
     best = s.best_estimator_
@@ -244,11 +270,21 @@ def fit_tabpfn(Xtr, ytr, num, cat):
     tp.fit(Xtr, ytr)
     return tp
 
-def repeated_cv(est, Xdev, ydev, tag):
+def repeated_cv(est, Xdev, ydev, tag, gdev=None):
+    """Repeated CV; GROUP-aware when replicates exist (each repeat randomly re-assigns whole
+    mixes to folds, so replicates of a mix are never split between train and validation)."""
     sc = []
     for r in range(REPEATED_REPEATS):
-        cv = KFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE + 59 * r)
-        for tr, va in cv.split(Xdev):
+        if gdev is not None and len(set(gdev)) < len(gdev):
+            rng = np.random.RandomState(RANDOM_STATE + 59 * r)
+            ug = np.unique(gdev); fold_of = dict(zip(ug, rng.randint(0, CV_FOLDS, size=len(ug))))
+            f = np.array([fold_of[g] for g in gdev])
+            splits = [(np.where(f != k)[0], np.where(f == k)[0]) for k in range(CV_FOLDS)]
+        else:
+            cv = KFold(CV_FOLDS, shuffle=True, random_state=RANDOM_STATE + 59 * r)
+            splits = list(cv.split(Xdev))
+        for tr, va in splits:
+            if len(va) == 0 or len(tr) == 0: continue
             e = clone(est); e.fit(Xdev.iloc[tr], ydev.iloc[tr])
             sc.append(r2_score(ydev.iloc[va], e.predict(Xdev.iloc[va])))
     sc = np.array(sc)
@@ -262,6 +298,9 @@ def main():
     if not HAS_XGB: raise RuntimeError("xgboost is required: pip install xgboost")
     df, y = load_data()
     tr, va, te = split_70_10_20(df, y)
+    groups = df[ID_COL].astype(str).values if ID_COL in df.columns else None
+    gtr = groups[tr] if groups is not None else None
+    gdev = groups[np.concatenate([tr, va])] if groups is not None else None
     rows, trained = [], {}
 
     for fs_name, feats in build_feature_sets().items():
@@ -271,7 +310,7 @@ def main():
         print(f"\n--- Feature set: {fs_name} ({len(avail)} features) ---")
         # tuned XGBoost
         try:
-            row, best = tune_xgb(Xtr, ytr, Xva, yva, num, cat)
+            row, best = tune_xgb(Xtr, ytr, Xva, yva, num, cat, gtr=gtr)
             row["Feature_Set"] = fs_name; row["Label"] = f"{fs_name} | XGBoost"
             rows.append(row)
             trained[row["Label"]] = {"est": best, "kind": "xgb", "Xtr": Xtr, "ytr": ytr, "Xva": Xva,
@@ -325,7 +364,7 @@ def main():
         obj = trained[lbl]
         Xdev = pd.concat([obj["Xtr"], obj["Xva"]]).reset_index(drop=True)
         ydev = pd.concat([obj["ytr"], obj["yva"]]).reset_index(drop=True)
-        m, s, mn = repeated_cv(obj["est"], Xdev, ydev, lbl)
+        m, s, mn = repeated_cv(obj["est"], Xdev, ydev, lbl, gdev=gdev)
         rcv_rows.append({"Label": lbl, "RepeatedCV_R2_mean": m, "RepeatedCV_R2_std": s, "RepeatedCV_R2_min": mn})
     rcv = pd.DataFrame(rcv_rows).sort_values("RepeatedCV_R2_mean", ascending=False).reset_index(drop=True)
 
