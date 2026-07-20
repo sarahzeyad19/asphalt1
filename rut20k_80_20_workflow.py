@@ -361,9 +361,34 @@ APPLY_CALIBRATION = True
 # Importance-based feature selection: rank the pooled candidate features by RandomForest importance
 # on the DEV rows only (no locked-test leakage) and register a reduced "TopImpact_Selected" set of
 # the K most impactful features, run through the normal pipeline alongside the other feature sets.
+# CORRECTION: the earlier pool name "Engineering_Core_WithOptionalPhysics" was never defined in
+# FEATURE_SETS, so the selector silently fell back to another set. Both selectors now point at the
+# explicitly defined "RutMechanism_CompactPool" (see FEATURE_SETS below).
 ADD_TOP_IMPACT_FEATURE_SET = True
 TOP_IMPACT_K = 10
-TOP_IMPACT_POOL = "VolumetricsB_NoADT_RBR_Both"
+TOP_IMPACT_POOL = "RutMechanism_CompactPool"
+
+# ---- Compact mechanism-based feature selector (stability + redundancy + size sweep) ----
+# Stage 1-2: per-CV-fold permutation importance PI on the TRAINING rows only; each feature gets
+#            Stability = max(0, mean(PI)) * PositiveFoldFraction / (1 + SD(PI))
+#            so a feature cannot rank highly because of one lucky fold.
+# Stage 3:   redundancy pruning — |Spearman rho| >= COMPACT_CORRELATION_THRESHOLD (training data
+#            only) drops the LOWER-ranked member of the pair (e.g. keep RBR_JMF_fraction OR
+#            RAP_pct_x_ACinRAP, not both).
+# Stage 4:   size sweep — for every k in COMPACT_CANDIDATE_COUNTS compute training OOF
+#            (grouped/stratified CV) R2, RMSE, MAE of the top-k surviving features.
+# Stage 5:   pick the SMALLEST subset with R2_k >= R2_best - COMPACT_R2_TOLERANCE and
+#            RMSE_k <= COMPACT_RMSE_TOLERANCE * RMSE_reference (so 9 inputs beat 15 when the
+#            extra 6 add only a negligible improvement).
+# The winning subset is registered as feature set "Compact_Selected" and competes in the normal
+# pipeline. All selector tables are written to the results workbook.
+RUN_COMPACT_SELECTOR = True
+COMPACT_POOL = "RutMechanism_CompactPool"
+COMPACT_CORRELATION_THRESHOLD = 0.92
+COMPACT_CANDIDATE_COUNTS = [5, 7, 9, 12, 15]
+COMPACT_R2_TOLERANCE = 0.01
+COMPACT_RMSE_TOLERANCE = 1.02
+COMPACT_PI_REPEATS = 5           # permutation repeats per fold for the stability score
 
 # Graph / analysis switches.
 SHOW_PLOTS_IN_SPYDER = True
@@ -548,6 +573,8 @@ NUMERIC_HINTS = [
     "RBR_JMF_fraction", "RBR_JMF_percent", "RAP_Binder_Contribution",
     "PG_x_RBR", "PG_x_RAPAC", "Abs_x_RBR", "SandEq_x_DustBinder",
     "Va_x_Gmm", "VFA_x_AC", "P0075_x_DustBinder",
+    "AggregateSkeletonIndex", "CompactionInstabilityIndex", "MasticStabilityIndex",
+    "RecycleFilmSeverity", "GradationArea_LogSieve",
 ]
 CATEGORICAL_HINTS = ["MixType", "DesignLev", "RAP_Class"]
 
@@ -641,6 +668,38 @@ def create_engineered_columns(df: pd.DataFrame) -> pd.DataFrame:
     if has("Pass0_075mm", "Dust_Binder"):
         df["P0075_x_DustBinder"] = pd.to_numeric(df["Pass0_075mm"], errors="coerce") * pd.to_numeric(df["Dust_Binder"], errors="coerce")
 
+    # ---- Mechanism indices for the compact selector (each built only when its source
+    #      columns exist, so the same script works on both cleaned data files) ----
+    if has("CAA", "FAA"):
+        # Coarse x fine angularity interlock — aggregate skeleton shear resistance.
+        df["AggregateSkeletonIndex"] = (pd.to_numeric(df["CAA"], errors="coerce")
+                                        * pd.to_numeric(df["FAA"], errors="coerce") / 100.0)
+    if has("Va", "VMA"):
+        # Fraction of the mineral-voids space left unfilled — compaction instability.
+        df["CompactionInstabilityIndex"] = safe_divide(df["Va"], df["VMA"])
+    if "SandEq" in df.columns and ("Dust_Pbe_ratio" in df.columns or "Dust_Binder" in df.columns):
+        # Clean sand vs dust-loaded mastic — mastic stability.
+        dust = df["Dust_Pbe_ratio"] if "Dust_Pbe_ratio" in df.columns else df["Dust_Binder"]
+        df["MasticStabilityIndex"] = pd.to_numeric(df["SandEq"], errors="coerce") / (
+            1.0 + pd.to_numeric(dust, errors="coerce"))
+    if "AFT_micron" in df.columns and "RBR_JMF_percent" in df.columns:
+        # RAP-stiffened binder spread over a thin film — recycle film severity.
+        df["RecycleFilmSeverity"] = safe_divide(df["RBR_JMF_percent"], df["AFT_micron"])
+    # Gradation area under the %-passing curve on a log-sieve axis (needs Grad_* columns).
+    try:
+        grad_pairs = []
+        for c in df.columns:
+            mm = re.findall(r"(?i)^grad[_ ]?(\d+(?:[._]\d+)?)\s*mm", str(c))
+            if mm:
+                grad_pairs.append((float(mm[0].replace("_", ".")), c))
+        if len(grad_pairs) >= 4:
+            grad_pairs.sort()
+            sizes = np.log10([s for s, _ in grad_pairs])
+            passing = df[[c for _, c in grad_pairs]].apply(pd.to_numeric, errors="coerce").values
+            df["GradationArea_LogSieve"] = np.trapz(passing, x=sizes, axis=1) / (sizes[-1] - sizes[0])
+    except Exception:
+        pass
+
     # Keep a clean RBR_band label for sensitivity grouping (not used as a model feature).
     if "RBR_band" not in df.columns and "RBR_JMF_fraction" in df.columns:
         f = pd.to_numeric(df["RBR_JMF_fraction"], errors="coerce")
@@ -676,6 +735,18 @@ PHYSICAL_INTERACTIONS = [
     "Va_x_Gmm", "VFA_x_AC", "P0075_x_DustBinder",
 ]
 
+# Explicitly defined pool for the compact mechanism-based selector (and the TopImpact selector):
+# mechanism-relevant raw inputs + physics interactions + the engineered mechanism indices.
+# Features missing from the loaded data file are dropped automatically by get_X.
+RUT_MECHANISM_COMPACT_POOL = [
+    "PG_HighTemp", "RBR_JMF_fraction", "RAP_pct_x_ACinRAP", "ACinRAP",
+    "AsphaltContent_Design", "VFA", "VMA", "Va", "Gmm", "Absorption",
+    "SandEq", "Dust_Binder", "FAA", "CAA", "Pass4_75mm", "Pass0_075mm", "NMAS (mm)",
+    "AggregateSkeletonIndex", "CompactionInstabilityIndex", "MasticStabilityIndex",
+    "RecycleFilmSeverity", "GradationArea_LogSieve",
+    "PG_x_RBR", "Abs_x_RBR", "SandEq_x_DustBinder", "Va_x_Gmm", "VFA_x_AC", "P0075_x_DustBinder",
+]
+
 STRUCT_GRAD_DESIGN = RUT_BASE_NOADT + ["NMAS (mm)", "Pass0_075mm", "MixType", "DesignLev", "RAP_Class"]
 FULL_EXPANDED_CLEAN = RUT_BASE_NOADT + [
     "NMAS (mm)", "Pass0_075mm", "MixType", "DesignLev", "RAP_Class",
@@ -692,6 +763,7 @@ FEATURE_SETS = {
     "SHAP14_RBR_PlusInteractions": SHAP14_RBR + PHYSICAL_INTERACTIONS,
     "StructGradDesign_CleanCategorical": STRUCT_GRAD_DESIGN,
     "FullExpanded_CleanCategorical": FULL_EXPANDED_CLEAN,
+    "RutMechanism_CompactPool": RUT_MECHANISM_COMPACT_POOL,
 }
 
 FEATURE_SETS_TO_RUN = [
@@ -881,6 +953,138 @@ def importance_ranked_feature_set(df: pd.DataFrame, y: pd.Series, dev_idx, pool_
     for f in top:
         print(f"    {f:<28} importance={imp[f]:.4f}")
     return top, imp
+
+
+def _selector_estimator():
+    """Fixed lightweight CPU model used ONLY inside the compact selector (fast + stable;
+    the winning subset is re-tuned later by the normal RandomizedSearch pipeline)."""
+    if HAS_XGBOOST:
+        return XGBRegressor(objective="reg:squarederror", n_estimators=500, learning_rate=0.03,
+                            max_depth=3, min_child_weight=10, subsample=0.8, colsample_bytree=0.8,
+                            reg_lambda=30.0, tree_method="hist", random_state=RANDOM_STATE,
+                            n_jobs=N_JOBS_MODEL)
+    return RandomForestRegressor(n_estimators=400, min_samples_leaf=5,
+                                 random_state=RANDOM_STATE, n_jobs=N_JOBS_MODEL)
+
+
+def _numeric_matrix(X: pd.DataFrame, numerical: List[str], categorical: List[str]) -> pd.DataFrame:
+    """Median-impute numerics and integer-encode categoricals into one numeric matrix."""
+    frames = []
+    if numerical:
+        frames.append(X[numerical].apply(lambda s: s.fillna(s.median())))
+    for c in categorical:
+        frames.append(pd.Series(pd.factorize(X[c].astype(str))[0], name=c, index=X.index))
+    return pd.concat(frames, axis=1)
+
+
+def compact_feature_selector(df: pd.DataFrame, y: pd.Series, train_idx):
+    """Compact mechanism-based feature selector. TRAINING rows only — the locked test never
+    enters any stage.
+
+    Stage 1-2: per-CV-fold permutation importance PI (each fold's PI measured on that fold's
+               held-out part), then
+                   Stability = max(0, mean(PI)) * PositiveFoldFraction / (1 + SD(PI))
+               so a feature cannot rank highly because of one lucky fold.
+    Stage 3:   |Spearman rho| >= COMPACT_CORRELATION_THRESHOLD drops the lower-ranked member
+               of every redundant pair.
+    Stage 4:   for every k in COMPACT_CANDIDATE_COUNTS, training OOF (grouped/stratified CV)
+               R2 / RMSE / MAE of the top-k surviving features.
+    Stage 5:   smallest k with R2_k >= R2_best - COMPACT_R2_TOLERANCE and
+               RMSE_k <= COMPACT_RMSE_TOLERANCE * RMSE_reference.
+    Returns (selected_features, tables_dict)."""
+    pool = FEATURE_SETS.get(COMPACT_POOL, [])
+    X, numerical, categorical, available, missing = get_X(df, pool)
+    if len(available) < 2:
+        raise ValueError(f"Compact pool {COMPACT_POOL!r} has <2 available features.")
+    train_idx = np.asarray(train_idx)
+    Xtr = X.iloc[train_idx].reset_index(drop=True)
+    ytr = pd.Series(y).iloc[train_idx].reset_index(drop=True)
+    Xmat = _numeric_matrix(Xtr, numerical, categorical)
+    groups_train = _GROUPS_FULL[train_idx] if _GROUPS_FULL is not None else None
+    splits, cv_name = make_cv_splits_for_training(ytr, groups_train)
+    print(f"\nCompact selector: pool={COMPACT_POOL} ({len(Xmat.columns)} available, "
+          f"missing: {missing or 'None'}) | {cv_name}")
+
+    # ---- Stage 1-2: fold-wise permutation importance -> stability score ----
+    pi = np.full((len(splits), Xmat.shape[1]), np.nan)
+    for i, (tr, va) in enumerate(splits):
+        est = clone(_selector_estimator())
+        est.fit(Xmat.iloc[tr], ytr.iloc[tr])
+        r = permutation_importance(est, Xmat.iloc[va], ytr.iloc[va],
+                                   n_repeats=COMPACT_PI_REPEATS, random_state=RANDOM_STATE,
+                                   scoring="r2", n_jobs=1)
+        pi[i] = r.importances_mean
+    mean_pi = np.nanmean(pi, axis=0)
+    sd_pi = np.nanstd(pi, axis=0, ddof=1)
+    pos_frac = np.mean(pi > 0, axis=0)
+    stability = np.maximum(0.0, mean_pi) * pos_frac / (1.0 + sd_pi)
+    stability_df = pd.DataFrame({
+        "Feature": Xmat.columns, "Mean_PI": mean_pi, "SD_PI": sd_pi,
+        "PositiveFoldFraction": pos_frac, "Stability": stability,
+    }).sort_values("Stability", ascending=False).reset_index(drop=True)
+    stability_df.insert(0, "Rank", range(1, len(stability_df) + 1))
+    print("  Stability ranking (top 10):")
+    for _, r in stability_df.head(10).iterrows():
+        print(f"    {int(r['Rank']):>2}. {r['Feature']:<28} Stability={r['Stability']:.5f} "
+              f"(meanPI={r['Mean_PI']:.5f}, +folds={r['PositiveFoldFraction']:.2f}, SD={r['SD_PI']:.5f})")
+
+    # ---- Stage 3: Spearman redundancy pruning (training data only, best rank wins) ----
+    corr = Xmat.corr(method="spearman").abs()
+    ranked = list(stability_df["Feature"])
+    kept, removed_rows = [], []
+    for f in ranked:
+        partner = next((k for k in kept if float(corr.loc[f, k]) >= COMPACT_CORRELATION_THRESHOLD), None)
+        if partner is None:
+            kept.append(f)
+        else:
+            removed_rows.append({"Removed_Feature": f, "Kept_Partner": partner,
+                                 "Abs_Spearman_rho": float(corr.loc[f, partner]),
+                                 "Threshold": COMPACT_CORRELATION_THRESHOLD})
+    removed_df = pd.DataFrame(removed_rows)
+    if removed_rows:
+        print(f"  Redundancy pruning (|rho| >= {COMPACT_CORRELATION_THRESHOLD}): removed "
+              + ", ".join(f"{r['Removed_Feature']} (kept {r['Kept_Partner']}, rho={r['Abs_Spearman_rho']:.3f})"
+                          for r in removed_rows))
+
+    # Keep only features with a non-zero stability score, in rank order.
+    kept = [f for f in kept if float(stability_df.loc[stability_df["Feature"] == f, "Stability"].iloc[0]) > 0] or kept
+
+    # ---- Stage 4: size sweep with training OOF scores ----
+    counts = sorted({k for k in COMPACT_CANDIDATE_COUNTS if k <= len(kept)} | {min(len(kept), min(COMPACT_CANDIDATE_COUNTS))})
+    sweep_rows = []
+    for k in counts:
+        feats = kept[:k]
+        oof, _folds = oof_predict(_selector_estimator(), Xmat[feats], ytr, splits)
+        m = metrics(ytr, oof)
+        sweep_rows.append({"N_Features": k, "OOF_R2": m["R2"], "OOF_RMSE": m["RMSE"],
+                           "OOF_MAE": m["MAE"], "Features": ", ".join(feats)})
+        print(f"  k={k:>2}: OOF R2={m['R2']:.4f} RMSE={m['RMSE']:.4f} MAE={m['MAE']:.4f}")
+    sweep_df = pd.DataFrame(sweep_rows)
+
+    # ---- Stage 5: smallest competitive subset ----
+    best_row = sweep_df.loc[sweep_df["OOF_R2"].idxmax()]
+    r2_best, rmse_ref = float(best_row["OOF_R2"]), float(best_row["OOF_RMSE"])
+    ok = sweep_df[(sweep_df["OOF_R2"] >= r2_best - COMPACT_R2_TOLERANCE)
+                  & (sweep_df["OOF_RMSE"] <= COMPACT_RMSE_TOLERANCE * rmse_ref)]
+    chosen = ok.loc[ok["N_Features"].idxmin()] if not ok.empty else best_row
+    selected = [f.strip() for f in chosen["Features"].split(",")]
+    sweep_df["Selected"] = sweep_df["N_Features"] == chosen["N_Features"]
+    summary_df = pd.DataFrame([{
+        "Pool": COMPACT_POOL, "Pool_Available": len(Xmat.columns), "Kept_After_Pruning": len(kept),
+        "Best_OOF_R2": r2_best, "Best_N_Features": int(best_row["N_Features"]),
+        "Selected_N_Features": int(chosen["N_Features"]), "Selected_OOF_R2": float(chosen["OOF_R2"]),
+        "Selected_OOF_RMSE": float(chosen["OOF_RMSE"]), "Selected_OOF_MAE": float(chosen["OOF_MAE"]),
+        "R2_Tolerance": COMPACT_R2_TOLERANCE, "RMSE_Tolerance_Factor": COMPACT_RMSE_TOLERANCE,
+        "Selected_Features": ", ".join(selected),
+    }])
+    print(f"  Selected the smallest competitive subset: {int(chosen['N_Features'])} features "
+          f"(best R2={r2_best:.4f} at k={int(best_row['N_Features'])}; "
+          f"selected R2={float(chosen['OOF_R2']):.4f}).")
+    for i, f in enumerate(selected, 1):
+        print(f"    {i}. {f}")
+    tables = {"Compact_Stability": stability_df, "Compact_Corr_Pruning": removed_df,
+              "Compact_Size_Sweep": sweep_df, "Compact_Selection": summary_df}
+    return selected, tables
 
 
 def make_ohe():
@@ -2106,6 +2310,18 @@ def main():
         except Exception as e:
             print(f"TopImpact feature selection skipped: {type(e).__name__}: {e}")
 
+    # ---- Compact mechanism-based selector: stability -> redundancy pruning -> size sweep ----
+    compact_tables: Dict[str, pd.DataFrame] = {}
+    if RUN_COMPACT_SELECTOR:
+        try:
+            compact_feats, compact_tables = compact_feature_selector(df, y, train_idx)
+            if compact_feats:
+                FEATURE_SETS["Compact_Selected"] = compact_feats
+                if "Compact_Selected" not in FEATURE_SETS_TO_RUN:
+                    FEATURE_SETS_TO_RUN.append("Compact_Selected")
+        except Exception as e:
+            print(f"Compact selector skipped: {type(e).__name__}: {e}")
+
     stat_features = sorted(set(VOLUMETRICS_B_RBR_BOTH + PHYSICAL_INTERACTIONS))
     desc_df, corr_df, vif_df = statistical_analysis(
         df.iloc[dev_idx_all].reset_index(drop=True), y.iloc[dev_idx_all].reset_index(drop=True),
@@ -2558,6 +2774,10 @@ def main():
         {"Setting": "N_ITER_XGB", "Value": N_ITER_XGB},
         {"Setting": "GPU status", "Value": gpu_status_string()},
         {"Setting": "True RBR", "Value": "RBR_JMF_fraction (=RBR_decimal), RBR_JMF_percent (=RBR_percent)"},
+        {"Setting": "Compact selector", "Value": (f"{RUN_COMPACT_SELECTOR} — pool={COMPACT_POOL}; stability-scored fold PI, "
+                                                  f"|rho|>={COMPACT_CORRELATION_THRESHOLD} pruning, counts {COMPACT_CANDIDATE_COUNTS}, "
+                                                  f"smallest subset within R2_best-{COMPACT_R2_TOLERANCE} and "
+                                                  f"{COMPACT_RMSE_TOLERANCE}x RMSE_ref (training rows only)")},
         {"Setting": "Stacking", "Value": f"{RUN_STACKING} ({list(best_params_for_stack.keys())})"},
         {"Setting": "Selection", "Value": ("Validation/Robust score; locked test never used for selection"
                                            if HAS_VAL_HOLDOUT else
@@ -2611,6 +2831,9 @@ def main():
         settings_df.to_excel(writer, sheet_name="Settings", index=False)
         split_summary.to_excel(writer, sheet_name="Split_Summary", index=False)
         feature_sets_df.to_excel(writer, sheet_name="Feature_Sets", index=False)
+        for _sheet, _tdf in compact_tables.items():
+            if _tdf is not None and not _tdf.empty:
+                _tdf.to_excel(writer, sheet_name=_sheet[:31], index=False)
         results_df.to_excel(writer, sheet_name="Candidate_Results", index=False)
         decision_df.to_excel(writer, sheet_name="Decision_Table", index=False)
         if not honest_cv_df.empty:
@@ -2652,6 +2875,9 @@ def main():
         if not graph_index_df.empty:
             graph_index_df.to_excel(writer, sheet_name="Graph_Index", index=False)
 
+    for _sheet, _tdf in compact_tables.items():
+        if _tdf is not None and not _tdf.empty:
+            _tdf.to_csv(PATHS["tables"] / f"{_sheet.lower()}.csv", index=False)
     results_df.to_csv(PATHS["tables"] / "candidate_results.csv", index=False)
     decision_df.to_csv(PATHS["tables"] / "decision_table.csv", index=False)
     final_metrics_df.to_csv(PATHS["tables"] / "final_train_val_test_metrics.csv", index=False)
