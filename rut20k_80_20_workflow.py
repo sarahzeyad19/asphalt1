@@ -384,8 +384,11 @@ QUICK_SMOKE_TEST = False
 
 # ---- Input file resolution ----
 HOME = Path.home()
-# Input data + outputs live here. Change this one line if your Downloads folder moves.
+# Input data + outputs live here. Falls back to the current user's Downloads folder (or the
+# working directory) automatically when this path does not exist on the machine.
 DOWNLOADS = Path(r"C:\Users\H0012066\Downloads")
+if not DOWNLOADS.exists():
+    DOWNLOADS = HOME / "Downloads" if (HOME / "Downloads").exists() else Path.cwd()
 RUT_FILENAME = "Rutting_Cleaned_with_RBR.xlsx"
 RUT_FILE = DOWNLOADS / RUT_FILENAME
 RUT_FILE_FALLBACKS = [
