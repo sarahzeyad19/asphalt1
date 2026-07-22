@@ -414,14 +414,20 @@ HOME = Path.home()
 DOWNLOADS = Path(r"C:\Users\H0012066\Downloads")
 if not DOWNLOADS.exists():
     DOWNLOADS = HOME / "Downloads" if (HOME / "Downloads").exists() else Path.cwd()
-RUT_FILENAME = "Rutting_Cleaned_with_RBR.xlsx"
+# Preferred: the combined cleaned workbook with the physics columns (AFT_micron, Pbe_pct, Gse,
+# Dust_Pbe_ratio, SurfaceArea_m2kg, Grad_* gradation, additives), sheet "RUT". The older
+# Rutting_Cleaned_with_RBR.xlsx stays as a fallback — missing physics columns are recomputed
+# from the equations sheet formulas where possible.
+RUT_FILENAME = "LWT__SCB_CLEANED.xlsx"
 RUT_FILE = DOWNLOADS / RUT_FILENAME
 RUT_FILE_FALLBACKS = [
-    DOWNLOADS / "725e0ea2-Rutting_Cleaned_with_RBR.xlsx",
+    DOWNLOADS / "LWT__SCB_CLEANED (1).xlsx",
+    DOWNLOADS / "Rutting_Cleaned_with_RBR.xlsx",
     DOWNLOADS / "Rutting_Cleaned_with_RBR (1).xlsx",
     DOWNLOADS / "Rutting_Cleaned_SpecBased.xlsx",
 ]
-SHEET_CANDIDATES = ["Cleaned_With_RBR", "Cleaned_Dataset", "Cleaned_Data_Kept", "Sheet1", 0]
+SHEET_CANDIDATES = ["RUT", "LWT_Clean_Modeling", "Cleaned_With_RBR", "Cleaned_Dataset",
+                    "Cleaned_Data_Kept", "Sheet1", 0]
 
 OUTPUT_FOLDER = DOWNLOADS / f"Rut20k_v3_{SPLIT_TAG}_RBR_outputs"
 
@@ -511,10 +517,12 @@ def resolve_file_path(path: Path, fallbacks: List[Path]) -> Path:
     try:
         script_dir = Path(__file__).resolve().parent
         candidates += [script_dir / p.name for p in list(candidates)]
+        candidates += list(script_dir.glob("*LWT__SCB_CLEANED*.xlsx"))
         candidates += list(script_dir.glob("*Rutting_Cleaned_with_RBR*.xlsx"))
     except Exception:
         pass
     candidates += [Path.cwd() / p.name for p in list(candidates)]
+    candidates += list(Path.cwd().glob("*LWT__SCB_CLEANED*.xlsx"))
     candidates += list(Path.cwd().glob("*Rutting_Cleaned_with_RBR*.xlsx"))
     seen, out = set(), []
     for p in candidates:
@@ -524,8 +532,9 @@ def resolve_file_path(path: Path, fallbacks: List[Path]) -> Path:
         if p.exists():
             return p
     raise FileNotFoundError(
-        "Could not find the Rutting Excel file. Put 'Rutting_Cleaned_with_RBR.xlsx' in your "
-        "Downloads folder or next to this script. Tried:\n" + "\n".join(str(p) for p in candidates[:12])
+        "Could not find the data Excel file. Put 'LWT__SCB_CLEANED.xlsx' (preferred) or "
+        "'Rutting_Cleaned_with_RBR.xlsx' in your Downloads folder or next to this script. "
+        "Tried:\n" + "\n".join(str(p) for p in candidates[:12])
     )
 
 
@@ -550,8 +559,9 @@ def read_excel_best_sheet(path: Path) -> pd.DataFrame:
 
 ALIASES = {
     "AsphaltContent_Design": ["AC_design", "AC_Design", "AsphaltContentDesign", "Design_AC"],
-    "Pass4_75mm": ["P4.75", "P4_75", "Pass_4_75mm", "Passing_4.75mm"],
-    "Pass0_075mm": ["P0.075", "P0_075", "Pass_0_075mm", "Passing_0.075mm"],
+    # In the LWT__SCB_CLEANED workbook the sieve columns are Grad_No4 (4.75 mm) / Grad_No200 (0.075 mm).
+    "Pass4_75mm": ["P4.75", "P4_75", "Pass_4_75mm", "Passing_4.75mm", "Grad_No4"],
+    "Pass0_075mm": ["P0.075", "P0_075", "Pass_0_075mm", "Passing_0.075mm", "Grad_No200"],
     "NMAS (mm)": ["NMAS", "NMAS_mm", "NMAS(mm)"],
     "PG_HighTemp": ["PG High", "PG_High", "PGHigh", "PG_High_Temp"],
     "RAP_pct": ["RAP", "RAP%", "RAP_Percent", "RAP_Pct"],
@@ -573,10 +583,18 @@ NUMERIC_HINTS = [
     "RBR_JMF_fraction", "RBR_JMF_percent", "RAP_Binder_Contribution",
     "PG_x_RBR", "PG_x_RAPAC", "Abs_x_RBR", "SandEq_x_DustBinder",
     "Va_x_Gmm", "VFA_x_AC", "P0075_x_DustBinder",
+    # Physics columns shipped in (or recomputed for) the LWT__SCB_CLEANED workbook.
+    "AFT_micron", "Pbe_pct", "Pba_pct", "Dust_Pbe_ratio", "Gse", "SurfaceArea_m2kg",
+    "SurfaceArea_ft2lb", "Additive_Rate_clean", "MixTemperature_F_clean",
+    "Grad_3_4in", "Grad_1_2in", "Grad_3_8in", "Grad_No4", "Grad_No8", "Grad_No16",
+    "Grad_No30", "Grad_No50", "Grad_No100", "Grad_No200",
+    # Engineered mechanism parameters.
     "AggregateSkeletonIndex", "CompactionInstabilityIndex", "MasticStabilityIndex",
-    "RecycleFilmSeverity", "GradationArea_LogSieve",
+    "RecycleFilmSeverity", "GradationArea_LogSieve", "EffectiveBinderAvailability",
+    "VirginBinderProxy", "PG_RecycleFilmSeverity", "BinderLubricationDemand",
+    "SkeletonLubricationBalance",
 ]
-CATEGORICAL_HINTS = ["MixType", "DesignLev", "RAP_Class"]
+CATEGORICAL_HINTS = ["MixType", "DesignLev", "RAP_Class", "Additive_Type_clean", "Additive_Type", "Has_Additive"]
 
 DROP_ALWAYS = [
     ID_COL, "Rut_20k", "SCB", "LWT_Record_ID", "SCB_Record_ID", "LWT_LastUpdated",
@@ -584,6 +602,7 @@ DROP_ALWAYS = [
     "Gmm_record_date", "Gmb_record_date", "Gmb_specimen_AC", "Review_Flags",
     "Aggregate_components_used", "IsLeft", "ADT", "RBR_band",
     "Flag_RBR_out_of_range", "Flag_missing_input",
+    "MixTemperature_flag_invalid", "MixTemperature_F", "Additive_Product", "Additive_Rate",
 ]
 
 
@@ -668,35 +687,121 @@ def create_engineered_columns(df: pd.DataFrame) -> pd.DataFrame:
     if has("Pass0_075mm", "Dust_Binder"):
         df["P0075_x_DustBinder"] = pd.to_numeric(df["Pass0_075mm"], errors="coerce") * pd.to_numeric(df["Dust_Binder"], errors="coerce")
 
-    # ---- Mechanism indices for the compact selector (each built only when its source
-    #      columns exist, so the same script works on both cleaned data files) ----
-    if has("CAA", "FAA"):
-        # Coarse x fine angularity interlock — aggregate skeleton shear resistance.
+    # =========================================================================
+    # PHYSICS CHAIN — equations from the LWT__SCB_CLEANED "Added variables" sheet.
+    # Each quantity is computed ONLY when the loaded file does not already ship it,
+    # so the same script runs on both cleaned data files.
+    # =========================================================================
+    GB_BINDER = 1.03     # binder specific gravity Gb used by the workbook equations
+    EPS = 1e-6
+    Pb = (pd.to_numeric(df["AsphaltContent_Design"], errors="coerce")
+          if "AsphaltContent_Design" in df.columns else None)
+
+    # Gse = (100 - Pb) / (100/Gmm - Pb/Gb)           effective aggregate specific gravity
+    if "Gse" not in df.columns and Pb is not None and "Gmm" in df.columns:
+        Gmm_ = pd.to_numeric(df["Gmm"], errors="coerce")
+        df["Gse"] = (100.0 - Pb) / (100.0 / Gmm_ - Pb / GB_BINDER)
+    # Pba = 100 * (Gse - Gsb) / (Gse * Gsb) * Gb     absorbed binder (%)
+    if "Pba_pct" not in df.columns and {"Gse", "Gsb"}.issubset(df.columns):
+        Gse_ = pd.to_numeric(df["Gse"], errors="coerce")
+        Gsb_ = pd.to_numeric(df["Gsb"], errors="coerce")
+        df["Pba_pct"] = 100.0 * (Gse_ - Gsb_) / (Gse_ * Gsb_) * GB_BINDER
+    # Pbe = Pb - (Pba/100) * (100 - Pb)              effective binder (%)
+    if "Pbe_pct" not in df.columns and Pb is not None and "Pba_pct" in df.columns:
+        df["Pbe_pct"] = Pb - (pd.to_numeric(df["Pba_pct"], errors="coerce") / 100.0) * (100.0 - Pb)
+    # Dust/Pbe = P0.075 / Pbe
+    if "Dust_Pbe_ratio" not in df.columns and {"Pass0_075mm", "Pbe_pct"}.issubset(df.columns):
+        df["Dust_Pbe_ratio"] = safe_divide(df["Pass0_075mm"], df["Pbe_pct"])
+    # Hveem surface area SA(ft2/lb) = 2 + 2P4 + 4P8 + 8P16 + 14P30 + 30P50 + 60P100 + 160P200
+    # (P as decimals); SA_m2kg = SA_ft2lb * 0.20482.
+    SA_FACTORS = {"Grad_No4": 2.0, "Grad_No8": 4.0, "Grad_No16": 8.0, "Grad_No30": 14.0,
+                  "Grad_No50": 30.0, "Grad_No100": 60.0, "Grad_No200": 160.0}
+    if "SurfaceArea_ft2lb" not in df.columns:
+        if "SurfaceArea_m2kg" in df.columns:
+            df["SurfaceArea_ft2lb"] = pd.to_numeric(df["SurfaceArea_m2kg"], errors="coerce") / 0.20482
+        elif set(SA_FACTORS).issubset(df.columns):
+            sa = 2.0
+            for c, f in SA_FACTORS.items():
+                sa = sa + f * (pd.to_numeric(df[c], errors="coerce") / 100.0)
+            df["SurfaceArea_ft2lb"] = sa
+            df["SurfaceArea_m2kg"] = sa * 0.20482
+    # AFT (um) = Pbe * 4870 / (100 * Ps * SA)   with Ps = (100 - Pb)/100 and SA in ft2/lb
+    if ("AFT_micron" not in df.columns and Pb is not None
+            and {"Pbe_pct", "SurfaceArea_ft2lb"}.issubset(df.columns)):
+        Ps = (100.0 - Pb) / 100.0
+        df["AFT_micron"] = pd.to_numeric(df["Pbe_pct"], errors="coerce") * 4870.0 / (
+            100.0 * Ps * pd.to_numeric(df["SurfaceArea_ft2lb"], errors="coerce"))
+
+    # =========================================================================
+    # NEW RUTTING PARAMETERS (mechanism indices; each built only when its source
+    # columns exist)
+    # =========================================================================
+    # 1. Effective binder availability  EBA = Pbe / (1 + Absorption)
+    if has("Pbe_pct", "Absorption"):
+        df["EffectiveBinderAvailability"] = pd.to_numeric(df["Pbe_pct"], errors="coerce") / (
+            1.0 + pd.to_numeric(df["Absorption"], errors="coerce"))
+    # 2. Virgin-binder proxy  VB = AC_design - RAP_pct * ACinRAP / 100
+    if has("AsphaltContent_Design", "RAP_pct", "ACinRAP"):
+        df["VirginBinderProxy"] = Pb - (pd.to_numeric(df["RAP_pct"], errors="coerce")
+                                        * pd.to_numeric(df["ACinRAP"], errors="coerce") / 100.0)
+    # 3. Recycled-binder film severity  RFS = RBR_percent / AFT
+    if has("RBR_JMF_percent", "AFT_micron"):
+        df["RecycleFilmSeverity"] = safe_divide(df["RBR_JMF_percent"], df["AFT_micron"])
+    # 4. PG x recycled-film severity  PG_RFS = PG_high * RFS
+    if has("PG_HighTemp", "RecycleFilmSeverity"):
+        df["PG_RecycleFilmSeverity"] = (pd.to_numeric(df["PG_HighTemp"], errors="coerce")
+                                        * pd.to_numeric(df["RecycleFilmSeverity"], errors="coerce"))
+    # 5. Mastic stability index  MSI = Pbe*AFT / ((1 + Dust/Pbe)(1 + Absorption))
+    #    (falls back to SandEq/(1 + Dust/Binder) when Pbe/AFT are unavailable)
+    if has("Pbe_pct", "AFT_micron", "Dust_Pbe_ratio", "Absorption"):
+        df["MasticStabilityIndex"] = (pd.to_numeric(df["Pbe_pct"], errors="coerce")
+                                      * pd.to_numeric(df["AFT_micron"], errors="coerce")) / (
+            (1.0 + pd.to_numeric(df["Dust_Pbe_ratio"], errors="coerce"))
+            * (1.0 + pd.to_numeric(df["Absorption"], errors="coerce")))
+    elif has("SandEq", "Dust_Binder"):
+        df["MasticStabilityIndex"] = pd.to_numeric(df["SandEq"], errors="coerce") / (
+            1.0 + pd.to_numeric(df["Dust_Binder"], errors="coerce"))
+    # 6. Aggregate-skeleton index
+    #    ASI = ((100 - P4.75)/100) * (NMAS/12.5) * (1 + CAA/100) * (1 + FAA/100)
+    if has("Pass4_75mm", "NMAS (mm)", "CAA", "FAA"):
+        df["AggregateSkeletonIndex"] = (
+            (100.0 - pd.to_numeric(df["Pass4_75mm"], errors="coerce")) / 100.0
+            * pd.to_numeric(df["NMAS (mm)"], errors="coerce") / 12.5
+            * (1.0 + pd.to_numeric(df["CAA"], errors="coerce") / 100.0)
+            * (1.0 + pd.to_numeric(df["FAA"], errors="coerce") / 100.0))
+    elif has("CAA", "FAA"):
         df["AggregateSkeletonIndex"] = (pd.to_numeric(df["CAA"], errors="coerce")
                                         * pd.to_numeric(df["FAA"], errors="coerce") / 100.0)
+    # 7. Binder-lubrication demand  BLD = Pbe / (P0.075 + Absorption + eps)
+    if has("Pbe_pct", "Pass0_075mm", "Absorption"):
+        df["BinderLubricationDemand"] = pd.to_numeric(df["Pbe_pct"], errors="coerce") / (
+            pd.to_numeric(df["Pass0_075mm"], errors="coerce")
+            + pd.to_numeric(df["Absorption"], errors="coerce") + EPS)
+    # 8. Skeleton-lubrication balance  SLB = ln((ASI + eps) / (BLD + eps))
+    if has("AggregateSkeletonIndex", "BinderLubricationDemand"):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = (pd.to_numeric(df["AggregateSkeletonIndex"], errors="coerce") + EPS) / (
+                pd.to_numeric(df["BinderLubricationDemand"], errors="coerce") + EPS)
+            df["SkeletonLubricationBalance"] = np.log(ratio.where(ratio > 0))
+    # 9. Compaction-instability index  CII = (Va / VMA) * (1 + RBR)
     if has("Va", "VMA"):
-        # Fraction of the mineral-voids space left unfilled — compaction instability.
-        df["CompactionInstabilityIndex"] = safe_divide(df["Va"], df["VMA"])
-    if "SandEq" in df.columns and ("Dust_Pbe_ratio" in df.columns or "Dust_Binder" in df.columns):
-        # Clean sand vs dust-loaded mastic — mastic stability.
-        dust = df["Dust_Pbe_ratio"] if "Dust_Pbe_ratio" in df.columns else df["Dust_Binder"]
-        df["MasticStabilityIndex"] = pd.to_numeric(df["SandEq"], errors="coerce") / (
-            1.0 + pd.to_numeric(dust, errors="coerce"))
-    if "AFT_micron" in df.columns and "RBR_JMF_percent" in df.columns:
-        # RAP-stiffened binder spread over a thin film — recycle film severity.
-        df["RecycleFilmSeverity"] = safe_divide(df["RBR_JMF_percent"], df["AFT_micron"])
-    # Gradation area under the %-passing curve on a log-sieve axis (needs Grad_* columns).
+        cii = safe_divide(df["Va"], df["VMA"])
+        if "RBR_JMF_fraction" in df.columns:
+            cii = cii * (1.0 + pd.to_numeric(df["RBR_JMF_fraction"], errors="coerce"))
+        df["CompactionInstabilityIndex"] = cii
+
+    # Gradation area under the %-passing curve on a log-sieve axis (named Grad_* sieves).
     try:
-        grad_pairs = []
-        for c in df.columns:
-            mm = re.findall(r"(?i)^grad[_ ]?(\d+(?:[._]\d+)?)\s*mm", str(c))
-            if mm:
-                grad_pairs.append((float(mm[0].replace("_", ".")), c))
+        _SIEVE_MM = {"Grad_1_1_2in": 37.5, "Grad_1in": 25.0, "Grad_3_4in": 19.0,
+                     "Grad_1_2in": 12.5, "Grad_3_8in": 9.5, "Grad_No4": 4.75,
+                     "Grad_No8": 2.36, "Grad_No16": 1.18, "Grad_No30": 0.60,
+                     "Grad_No50": 0.30, "Grad_No100": 0.15, "Grad_No200": 0.075}
+        grad_pairs = sorted((mm, c) for c, mm in _SIEVE_MM.items() if c in df.columns)
         if len(grad_pairs) >= 4:
-            grad_pairs.sort()
             sizes = np.log10([s for s, _ in grad_pairs])
             passing = df[[c for _, c in grad_pairs]].apply(pd.to_numeric, errors="coerce").values
-            df["GradationArea_LogSieve"] = np.trapz(passing, x=sizes, axis=1) / (sizes[-1] - sizes[0])
+            trap = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+            df["GradationArea_LogSieve"] = trap(passing, x=sizes, axis=1) / (sizes[-1] - sizes[0])
     except Exception:
         pass
 
@@ -736,15 +841,28 @@ PHYSICAL_INTERACTIONS = [
 ]
 
 # Explicitly defined pool for the compact mechanism-based selector (and the TopImpact selector):
-# mechanism-relevant raw inputs + physics interactions + the engineered mechanism indices.
-# Features missing from the loaded data file are dropped automatically by get_X.
+# mechanism-relevant raw inputs + physics columns (Pbe/AFT chain) + physics interactions + the
+# engineered mechanism indices. Features missing from the loaded file are dropped by get_X.
 RUT_MECHANISM_COMPACT_POOL = [
     "PG_HighTemp", "RBR_JMF_fraction", "RAP_pct_x_ACinRAP", "ACinRAP",
     "AsphaltContent_Design", "VFA", "VMA", "Va", "Gmm", "Absorption",
     "SandEq", "Dust_Binder", "FAA", "CAA", "Pass4_75mm", "Pass0_075mm", "NMAS (mm)",
-    "AggregateSkeletonIndex", "CompactionInstabilityIndex", "MasticStabilityIndex",
-    "RecycleFilmSeverity", "GradationArea_LogSieve",
+    "Pbe_pct", "AFT_micron", "Dust_Pbe_ratio", "SurfaceArea_m2kg", "Gse",
+    "EffectiveBinderAvailability", "VirginBinderProxy", "RecycleFilmSeverity",
+    "PG_RecycleFilmSeverity", "MasticStabilityIndex", "AggregateSkeletonIndex",
+    "BinderLubricationDemand", "SkeletonLubricationBalance", "CompactionInstabilityIndex",
+    "GradationArea_LogSieve",
     "PG_x_RBR", "Abs_x_RBR", "SandEq_x_DustBinder", "Va_x_Gmm", "VFA_x_AC", "P0075_x_DustBinder",
+]
+
+# The nine new rutting parameters + the core physics columns as a stand-alone candidate set,
+# so their contribution is measured directly against the older feature sets.
+RUT_PHYSICS_NEW_PARAMS = [
+    "PG_HighTemp", "RBR_JMF_fraction", "Va", "VFA", "SandEq",
+    "Pbe_pct", "AFT_micron", "Dust_Pbe_ratio",
+    "EffectiveBinderAvailability", "VirginBinderProxy", "RecycleFilmSeverity",
+    "PG_RecycleFilmSeverity", "MasticStabilityIndex", "AggregateSkeletonIndex",
+    "BinderLubricationDemand", "SkeletonLubricationBalance", "CompactionInstabilityIndex",
 ]
 
 STRUCT_GRAD_DESIGN = RUT_BASE_NOADT + ["NMAS (mm)", "Pass0_075mm", "MixType", "DesignLev", "RAP_Class"]
@@ -764,6 +882,7 @@ FEATURE_SETS = {
     "StructGradDesign_CleanCategorical": STRUCT_GRAD_DESIGN,
     "FullExpanded_CleanCategorical": FULL_EXPANDED_CLEAN,
     "RutMechanism_CompactPool": RUT_MECHANISM_COMPACT_POOL,
+    "RutPhysics_NewParams": RUT_PHYSICS_NEW_PARAMS,
 }
 
 FEATURE_SETS_TO_RUN = [
@@ -776,9 +895,10 @@ FEATURE_SETS_TO_RUN = [
     "SHAP14_RBR_PlusInteractions",
     "StructGradDesign_CleanCategorical",
     "FullExpanded_CleanCategorical",
+    "RutPhysics_NewParams",
 ]
 if QUICK_SMOKE_TEST:
-    FEATURE_SETS_TO_RUN = ["VolumetricsB_NoADT_RBR_Both", "SHAP12_RBR_PlusInteractions"]
+    FEATURE_SETS_TO_RUN = ["VolumetricsB_NoADT_RBR_Both", "RutPhysics_NewParams"]
 
 
 # =============================================================================
