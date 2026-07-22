@@ -142,12 +142,13 @@ ID_COL = "MixDesignKey"
 # kept together in a split / CV fold) before falling back to a per-report key.
 ID_COL_ALIASES = [ID_COL, "Unified_Mix_ID", "Base_Mix_ID", "Mix_ID", "JMF_Record_Key", "JMF_Number"]
 
-# ---- DATA SPLIT (requested: 80% training WITH the target / 20% locked test) ----
-# VALIDATION_SIZE = 0 means NO separate validation holdout: the model trains on the full 80%
-# (features X + Rut_20k target y together, as required for supervised learning) and every
-# "validation" score becomes the honest out-of-fold 5-fold CV score inside that 80%.
-TRAIN_SIZE = 0.80
-VALIDATION_SIZE = 0.00
+# ---- DATA SPLIT (requested: 70% training / 10% validation / 20% locked test) ----
+# Two-stage stratified (and mix-grouped) split: the 20% locked test is peeled off FIRST, then
+# the remaining 80% is carved into 70% train + 10% validation. The 10% validation is a genuine
+# holdout used for model/feature selection; the 20% test is scored once at the very end.
+# (Set VALIDATION_SIZE = 0 to go back to 80/20 with OOF-CV validation.)
+TRAIN_SIZE = 0.70
+VALIDATION_SIZE = 0.10
 TEST_SIZE = 0.20
 HAS_VAL_HOLDOUT = VALIDATION_SIZE > 0
 SPLIT_TAG = (f"{int(TRAIN_SIZE*100)}_{int(TEST_SIZE*100)}" if not HAS_VAL_HOLDOUT
