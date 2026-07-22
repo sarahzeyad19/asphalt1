@@ -215,7 +215,7 @@ RUN_HIGH_RUT_WEIGHTING = False
 #   high ones); the model "compresses" the high tail (best-fit slope < 1). Modelling in log
 #   space symmetrises the target -> better high-value behaviour and a smaller gap. All metrics,
 #   best-fit lines, residuals and plots are reported back on the ORIGINAL scale.
-AVERAGE_REPLICATES = False
+AVERAGE_REPLICATES = True   # denoise: average replicate tests of each mix to ONE target
 LOG_TARGET = False  # raw target. (Log lowered rutting numbers — the target isn't skewed enough
                     # to benefit. Set True only for a strongly right-skewed target like SCB.)
 
@@ -402,45 +402,33 @@ if not DOWNLOADS.exists():
 # from the equations sheet formulas where possible.
 # Primary = the cleaned SCB workbook (with the physics columns Pbe/AFT/Gse, gradation, additives).
 # Falls back to the LaPave workbooks if the cleaned SCB file is not present on your machine.
-RUT_FILENAME = "SCB_Cleaned_with_RBR.xlsx"
+# PRIMARY = the DESIGN-stage SCB sheet (one design row per mix). ADDITIONAL = the new LWT SCB
+# data (extra replicate test results). We model on the DESIGN mix properties, combined with the
+# new data, and average replicate tests of each mix to a single de-noised target (see below).
+RUT_FILENAME = "Design_Validation_Rutting_SCB_Separated_Cleaned.xlsx"
 RUT_FILE = DOWNLOADS / RUT_FILENAME
 RUT_FILE_FALLBACKS = [
     DOWNLOADS / "LWT__SCB_CLEANED.xlsx",
-    DOWNLOADS / "LWT__SCB_CLEANED (1).xlsx",
-    DOWNLOADS / "LaPave_Audited_Master_RUT_SCB.xlsx",
-    DOWNLOADS / "LaPave_Validation_Full_Matched_RUT_SCB.xlsx",
-    DOWNLOADS / "SCB_Cleaned_SpecBased.xlsx",
+    DOWNLOADS / "SCB_Cleaned_with_RBR.xlsx",
 ]
-# SCB sheet names first (cleaned file), then the LaPave master/validation SCB sheets.
-SHEET_CANDIDATES = ["SCB", "Cleaned_With_RBR", "Cleaned_Dataset", "Cleaned_Data_Kept",
-                    "SCB_Master_666", "SCB_Full_Mixes", "LWT_Clean_Modeling", "Sheet1", 0]
+# Design_SCB sheet first; fall back to other SCB sheet names.
+SHEET_CANDIDATES = ["Design_SCB", "SCB", "Cleaned_With_RBR", "Cleaned_Dataset", "Sheet1", 0]
 
 # ---- Combine several data files (union of rows) --------------------------------------------
-# When COMBINE_ADDITIONAL_FILES is True the primary file above is loaded FIRST and then every
-# source below is appended: each file's columns are harmonized to the canonical names, the rows
-# are concatenated, and duplicate mixes/reports are removed (on JMF_Record_Key, else Mix_ID +
-# target) so a mix present in two files is not double-counted. Missing files are skipped with a
-# warning, so the script still runs if you only have some of them.
-# For SCB we combine the CLEANED SCB data with the NEW LaPave data (audited master SCB_Master_666
-# + matched-validation SCB_Full_Mixes).
+# Model on the DESIGN SCB mixes + the additional new LWT SCB data. Rows are harmonized to the
+# canonical columns, concatenated, and (with AVERAGE_REPLICATES) collapsed to one de-noised
+# target per mix. Missing files are skipped with a warning.
 COMBINE_ADDITIONAL_FILES = True
 ADDITIONAL_DATA_SOURCES = [
-    # 666-mix audited master (SCB sheet).
-    (["LaPave_Audited_Master_RUT_SCB.xlsx", "LaPave_Audited_Master_RUT_SCB (1).xlsx"],
-     ["SCB_Master_666", "SCB_Master", "SCB_Full_Mixes"]),
-    # 177-mix matched validation (SCB sheet).
-    (["LaPave_Validation_Full_Matched_RUT_SCB.xlsx"],
-     ["SCB_Full_Mixes", "SCB"]),
-    # Cleaned SCB file (kept as an additional source in case the primary resolved elsewhere).
-    (["SCB_Cleaned_with_RBR.xlsx", "LWT__SCB_CLEANED.xlsx"],
-     ["SCB", "Cleaned_With_RBR", "Cleaned_Dataset"]),
+    # New LWT SCB data (extra replicate measurements; same MixDesignKey scheme as the design sheet).
+    (["LWT__SCB_CLEANED.xlsx", "SCB_Cleaned_with_RBR.xlsx"], ["SCB", "Cleaned_With_RBR"]),
 ]
 # De-duplication key priority when merging files (first present wins).
-DEDUP_KEYS = ["JMF_Record_Key", "Mix_ID", "Unified_Mix_ID"]
+DEDUP_KEYS = ["JMF_Record_Key", "Mix_ID", "Unified_Mix_ID"]  # (MixDesignKey handled by AVERAGE_REPLICATES)
 # Content-based dedup (leakage guard): collapse the SAME physical mix reported in two files under
 # different IDs (identical modelling features + target). Strongly recommended for publication —
 # without it, identical mixes can land in both train and test even though the mix IDs differ.
-DEDUP_BY_FEATURE_SIGNATURE = True
+DEDUP_BY_FEATURE_SIGNATURE = False  # MixDesignKey is reliable here; averaging handles duplicates
 FEATURE_SIGNATURE_COLS = [
     "PG_HighTemp", "RBR_JMF_fraction", "Va", "VMA", "VFA", "Gmm", "Gmb", "Gsb", "Gse",
     "Pbe_pct", "AFT_micron", "Dust_Pbe_ratio", "ACinRAP", "RAP_pct", "Absorption", "SandEq",

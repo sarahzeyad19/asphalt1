@@ -202,8 +202,8 @@ ID_COL_ALIASES = [ID_COL, "Unified_Mix_ID", "Base_Mix_ID", "Mix_ID", "JMF_Record
 # VALIDATION_SIZE = 0 means NO separate validation holdout: the model trains on the full 80%
 # (features X + Rut_20k target y together, as required for supervised learning) and every
 # "validation" score becomes the honest out-of-fold 5-fold CV score inside that 80%.
-TRAIN_SIZE = 0.80
-VALIDATION_SIZE = 0.00
+TRAIN_SIZE = 0.70
+VALIDATION_SIZE = 0.10
 TEST_SIZE = 0.20
 HAS_VAL_HOLDOUT = VALIDATION_SIZE > 0
 SPLIT_TAG = (f"{int(TRAIN_SIZE*100)}_{int(TEST_SIZE*100)}" if not HAS_VAL_HOLDOUT
@@ -270,7 +270,7 @@ RUN_HIGH_RUT_WEIGHTING = False
 #   high ones); the model "compresses" the high tail (best-fit slope < 1). Modelling in log
 #   space symmetrises the target -> better high-value behaviour and a smaller gap. All metrics,
 #   best-fit lines, residuals and plots are reported back on the ORIGINAL scale.
-AVERAGE_REPLICATES = False
+AVERAGE_REPLICATES = True   # denoise: average replicate tests of each mix to ONE target
 LOG_TARGET = False  # raw target. (Log lowered rutting numbers — the target isn't skewed enough
                     # to benefit. Set True only for a strongly right-skewed target like SCB.)
 
@@ -443,18 +443,17 @@ if not DOWNLOADS.exists():
 # Dust_Pbe_ratio, SurfaceArea_m2kg, Grad_* gradation, additives), sheet "RUT". The older
 # Rutting_Cleaned_with_RBR.xlsx stays as a fallback — missing physics columns are recomputed
 # from the equations sheet formulas where possible.
-RUT_FILENAME = "LaPave_Validation_Full_Matched_RUT_SCB.xlsx"
+# PRIMARY = the DESIGN-stage rutting sheet (one design row per mix). ADDITIONAL = the new LWT
+# rut data (extra replicate results). Model on the DESIGN mix properties + the new data, with
+# replicate tests of each mix averaged to a single de-noised target (AVERAGE_REPLICATES).
+RUT_FILENAME = "Design_Validation_Rutting_SCB_Separated_Cleaned.xlsx"
 RUT_FILE = DOWNLOADS / RUT_FILENAME
 RUT_FILE_FALLBACKS = [
     DOWNLOADS / "LWT__SCB_CLEANED.xlsx",
-    DOWNLOADS / "LWT__SCB_CLEANED (1).xlsx",
     DOWNLOADS / "Rutting_Cleaned_with_RBR.xlsx",
-    DOWNLOADS / "Rutting_Cleaned_with_RBR (1).xlsx",
-    DOWNLOADS / "Rutting_Cleaned_SpecBased.xlsx",
 ]
-# RUT_Full_Mixes = the rut target sheet in the LaPave validation workbook; earlier names kept.
-SHEET_CANDIDATES = ["RUT_Master_923", "RUT_Full_Mixes", "RUT", "LWT_Clean_Modeling",
-                    "Cleaned_With_RBR", "Cleaned_Dataset", "Cleaned_Data_Kept", "Sheet1", 0]
+# Design_Rutting sheet first; fall back to other rut sheet names.
+SHEET_CANDIDATES = ["Design_Rutting", "RUT", "Cleaned_With_RBR", "Cleaned_Dataset", "Sheet1", 0]
 
 # ---- Combine several data files (union of rows) --------------------------------------------
 # When COMBINE_ADDITIONAL_FILES is True the primary file above is loaded FIRST and then every
@@ -464,20 +463,15 @@ SHEET_CANDIDATES = ["RUT_Master_923", "RUT_Full_Mixes", "RUT", "LWT_Clean_Modeli
 # warning, so the script still runs if you only have some of them.
 COMBINE_ADDITIONAL_FILES = True
 ADDITIONAL_DATA_SOURCES = [
-    # (candidate filenames, candidate sheet names) — the 923-mix audited master.
-    (["LaPave_Audited_Master_RUT_SCB.xlsx", "LaPave_Audited_Master_RUT_SCB (1).xlsx"],
-     ["RUT_Master_923", "RUT_Master", "RUT_Full_Mixes"]),
-    # The 132-mix matched validation file (kept as an additional source too, in case the
-    # primary above resolves to a different file on your machine).
-    (["LaPave_Validation_Full_Matched_RUT_SCB.xlsx"],
-     ["RUT_Full_Mixes", "RUT"]),
+    # New LWT rutting data (extra replicate measurements; same MixDesignKey scheme as the design sheet).
+    (["LWT__SCB_CLEANED.xlsx", "Rutting_Cleaned_with_RBR.xlsx"], ["RUT", "Cleaned_With_RBR"]),
 ]
 # De-duplication key priority when merging files (first present wins).
 DEDUP_KEYS = ["JMF_Record_Key", "Mix_ID", "Unified_Mix_ID"]
 # Content-based dedup (leakage guard): collapse the SAME physical mix reported in two files under
 # different IDs (identical modelling features + target). Strongly recommended for publication --
 # without it, identical mixes can land in both train and test even though the mix IDs differ.
-DEDUP_BY_FEATURE_SIGNATURE = True
+DEDUP_BY_FEATURE_SIGNATURE = False  # MixDesignKey is reliable here; averaging handles duplicates
 FEATURE_SIGNATURE_COLS = [
     "PG_HighTemp", "RBR_JMF_fraction", "Va", "VMA", "VFA", "Gmm", "Gmb", "Gsb", "Gse",
     "Pbe_pct", "AFT_micron", "Dust_Pbe_ratio", "ACinRAP", "RAP_pct", "Absorption", "SandEq",
