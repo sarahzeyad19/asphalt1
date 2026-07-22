@@ -191,9 +191,12 @@ TARGET = "Rut_20k"
 # Target column aliases: the LaPave validation workbook stores the rut target as
 # "LWT_Validation_Rut"; the older files use "Rut_20k". The first present column is renamed
 # to TARGET in load_data so the same script runs on every file.
-TARGET_ALIASES = ["Rut_20k", "LWT_Validation_Rut", "LWT_Rut", "Rut_Value", "Rutting"]
+TARGET_ALIASES = ["Rut_20k", "LWT_Design_Extracted", "LWT_Validation_Rut", "LWT_Rut",
+                  "Rut_Value", "Rutting"]
 ID_COL = "MixDesignKey"
-ID_COL_ALIASES = [ID_COL, "Mix_ID", "JMF_Record_Key", "JMF_Number"]
+# Prefer a MIX-level identity (so all replicate reports of one mix share a group and can be
+# kept together in a split / CV fold) before falling back to a per-report key.
+ID_COL_ALIASES = [ID_COL, "Unified_Mix_ID", "Base_Mix_ID", "Mix_ID", "JMF_Record_Key", "JMF_Number"]
 
 # ---- DATA SPLIT (requested: 80% training WITH the target / 20% locked test) ----
 # VALIDATION_SIZE = 0 means NO separate validation holdout: the model trains on the full 80%
@@ -237,7 +240,11 @@ N_JOBS_MODEL = -1
 # no-leakage protocol — train/val/test split, the inner training CV, RepeatedCV and Nested CV all
 # become group-aware (StratifiedGroupKFold). Honest note: removing this leakage usually LOWERS the
 # reported R2 slightly (the previous number was mildly inflated), but it is the correct estimate.
-GROUP_SPLIT_BY_MIX = False
+# DEFAULT True now that the audited master file is combined in: it carries multiple replicate
+# reports of the same mix (identical design-extracted target), so a row-level split WOULD leak
+# and inflate R2. Grouping on the mix ID keeps every replicate together and gives the honest
+# score while still using all the rows. Set False only for a single file with no replicates.
+GROUP_SPLIT_BY_MIX = True
 GROUP_COL = ID_COL
 _GROUPS_FULL = None  # set in main() from df[GROUP_COL]; None disables grouping at runtime
 
@@ -432,9 +439,28 @@ RUT_FILE_FALLBACKS = [
     DOWNLOADS / "Rutting_Cleaned_with_RBR (1).xlsx",
     DOWNLOADS / "Rutting_Cleaned_SpecBased.xlsx",
 ]
-# RUT_Full_Mixes = the rut target sheet in the LaPave workbook; earlier names kept as fallbacks.
-SHEET_CANDIDATES = ["RUT_Full_Mixes", "RUT", "LWT_Clean_Modeling", "Cleaned_With_RBR",
-                    "Cleaned_Dataset", "Cleaned_Data_Kept", "Sheet1", 0]
+# RUT_Full_Mixes = the rut target sheet in the LaPave validation workbook; earlier names kept.
+SHEET_CANDIDATES = ["RUT_Master_923", "RUT_Full_Mixes", "RUT", "LWT_Clean_Modeling",
+                    "Cleaned_With_RBR", "Cleaned_Dataset", "Cleaned_Data_Kept", "Sheet1", 0]
+
+# ---- Combine several data files (union of rows) --------------------------------------------
+# When COMBINE_ADDITIONAL_FILES is True the primary file above is loaded FIRST and then every
+# source below is appended: each file's columns are harmonized to the canonical names, the rows
+# are concatenated, and duplicate mixes/reports are removed (on JMF_Record_Key, else Mix_ID +
+# target) so a mix present in two files is not double-counted. Missing files are skipped with a
+# warning, so the script still runs if you only have some of them.
+COMBINE_ADDITIONAL_FILES = True
+ADDITIONAL_DATA_SOURCES = [
+    # (candidate filenames, candidate sheet names) — the 923-mix audited master.
+    (["LaPave_Audited_Master_RUT_SCB.xlsx", "LaPave_Audited_Master_RUT_SCB (1).xlsx"],
+     ["RUT_Master_923", "RUT_Master", "RUT_Full_Mixes"]),
+    # The 132-mix matched validation file (kept as an additional source too, in case the
+    # primary above resolves to a different file on your machine).
+    (["LaPave_Validation_Full_Matched_RUT_SCB.xlsx"],
+     ["RUT_Full_Mixes", "RUT"]),
+]
+# De-duplication key priority when merging files (first present wins).
+DEDUP_KEYS = ["JMF_Record_Key", "Mix_ID", "Unified_Mix_ID"]
 
 OUTPUT_FOLDER = DOWNLOADS / f"Rut20k_v3_{SPLIT_TAG}_RBR_outputs"
 
@@ -567,53 +593,64 @@ def read_excel_best_sheet(path: Path) -> pd.DataFrame:
 # =============================================================================
 
 ALIASES = {
-    # LaPave workbook stores volumetrics under "Validation_Average__*" and aggregate properties
-    # under "Combined_Aggregate_*"; gradation under "Validation_Average__Passing_*".
+    # Three source layouts are supported and harmonized to these canonical names:
+    #   * LaPave VALIDATION file: "Validation_Average__*", "Combined_Aggregate_*",
+    #     "Validation_Average__Passing_*".
+    #   * LaPave AUDITED MASTER file: "Design_Submission__*" volumetrics/gradation, "*_Recalc"
+    #     / "*_Final" physics, plus bare PG_HighTemp / NMAS_mm.
+    #   * older LWT/Rutting cleaned files: "Grad_*", "RBR_percent", etc.
     "AsphaltContent_Design": ["AC_design", "AC_Design", "AsphaltContentDesign", "Design_AC",
-                              "Validation_Average__Asphalt_Content"],
-    # Sieve columns: LWT file uses Grad_No4/Grad_No200; LaPave uses Validation_Average__Passing_No4/No200.
+                              "Validation_Average__Asphalt_Content", "Design_Submission__Percent_AC"],
     "Pass4_75mm": ["P4.75", "P4_75", "Pass_4_75mm", "Passing_4.75mm", "Grad_No4",
-                   "Validation_Average__Passing_No4"],
+                   "Validation_Average__Passing_No4", "Design_Submission__Pass_No_4"],
     "Pass0_075mm": ["P0.075", "P0_075", "Pass_0_075mm", "Passing_0.075mm", "Grad_No200",
-                    "Validation_Average__Passing_No200"],
-    "NMAS (mm)": ["NMAS", "NMAS_mm", "NMAS(mm)"],  # LaPave: parsed from Nominal_Aggregate_Size (text)
-    "PG_HighTemp": ["PG High", "PG_High", "PGHigh", "PG_High_Temp"],  # LaPave: parsed from PG_Grade_Normalized
+                    "Validation_Average__Passing_No200", "Design_Submission__Pass_No_200"],
+    "NMAS (mm)": ["NMAS", "NMAS_mm", "NMAS(mm)"],  # else parsed from Nominal_Aggregate_Size (text)
+    "PG_HighTemp": ["PG High", "PG_High", "PGHigh", "PG_High_Temp", "PG_HighTemp"],  # else parsed from PG grade
+    "PG_LowTemp": ["PG_LowTemp", "PG Low", "PG_Low"],
     "RAP_pct": ["RAP", "RAP%", "RAP_Percent", "RAP_Pct"],
-    "ACinRAP": ["AC_in_RAP", "AC_RAP", "ACin_RAP"],
+    "ACinRAP": ["AC_in_RAP", "AC_RAP", "ACin_RAP", "ACinRAP_Recalc"],
     "Dust_Binder": ["DustBinder", "Dust_to_Binder", "Dust/Binder"],
     "SandEq": ["Sand_Equivalent", "SandEQ", "SE", "Combined_Aggregate_Sand_Equivalent"],
     "FAA": ["Combined_Aggregate_FAA"],
     "CAA": ["Combined_Aggregate_CAA"],
     "Absorption": ["Combined_Aggregate_Absorption"],
-    "VMA": ["Validation_Average__VMA"],
-    "VFA": ["Validation_Average__VFA"],
-    "Va": ["Air_Voids", "AirVoids", "Validation_Average__Air_Voids"],
-    "Gmm": ["Validation_Average__Gmm"],
-    "Gmb": ["Validation_Average__Gmb"],
+    "VMA": ["Validation_Average__VMA", "Design_Submission__VMA"],
+    "VFA": ["Validation_Average__VFA", "Design_Submission__VFA"],
+    "Va": ["Air_Voids", "AirVoids", "Validation_Average__Air_Voids", "Design_Submission__Percent_Voids"],
+    "Gmm": ["Validation_Average__Gmm", "Design_Submission__Gmm"],
+    "Gmb": ["Validation_Average__Gmb", "Design_Submission__Gmb_Nd"],
     "Gsb": ["Combined_Aggregate_Bulk_Gravity"],
-    "Gse": ["Validation_Average__Gse"],
-    "Pba_pct": ["Validation_Average__Pba"],
-    "Pbe_pct": ["Validation_Average__Pbe"],
-    "Dust_Pbe_ratio": ["Validation_Average__Dust_to_Effective_Binder", "Dust_to_Effective_Binder"],
+    "Gse": ["Validation_Average__Gse", "Design_Submission__Gse"],
+    "Pba_pct": ["Validation_Average__Pba", "Design_Submission__Pba"],
+    "Pbe_pct": ["Validation_Average__Pbe", "Pbe_Final", "Pbe_Reported", "Design_Submission__Pbe"],
+    "Dust_Pbe_ratio": ["Validation_Average__Dust_to_Effective_Binder", "Dust_to_Effective_Binder",
+                       "Design_Submission__Dust_Pbeff"],
+    "SurfaceArea_m2kg": ["SurfaceArea_m2kg_Recalc"],
+    "AFT_micron": ["AFT_micron_Recalc"],
     "DesignLev": ["DesignLevel", "Design_Level", "TrafficLevel"],
     "MixType": ["Mix_Type", "Mixture_Type", "Type"],
-    "RAP_Class": ["RAPClass", "RAP class", "RAP_Classification", "RBR_Band", "RBR_band"],
+    "RAP_Class": ["RAPClass", "RAP class", "RAP_Classification", "RBR_Band", "RBR_band",
+                  "RBR_Class", "RAP_Spec_Class"],
     "Has_Additive": ["Has_Antistrip"],
-    "Additive_Type": ["Antistrip_Type", "Additive_Type_clean"],
-    # RBR from the cleaned file.
+    "Additive_Type": ["Antistrip_Type", "Additive_Type_clean", "Antistrip_Family_Standardized",
+                      "Additive_Family"],
+    # RBR: master ships RBR_percent_Recalc; older files RBR_percent / RBR_decimal.
     "RBR_JMF_fraction": ["RBR_decimal", "RBR_fraction", "RBR"],
-    "RBR_JMF_percent": ["RBR_percent", "RBR_pct"],
-    # Full gradation: map LaPave Passing_* to the canonical Grad_* names used by the SA / area calcs.
-    "Grad_3_4in": ["Validation_Average__Passing_3_4in"],
-    "Grad_1_2in": ["Validation_Average__Passing_1_2in"],
-    "Grad_3_8in": ["Validation_Average__Passing_3_8in"],
-    "Grad_No4": ["Validation_Average__Passing_No4"],
-    "Grad_No8": ["Validation_Average__Passing_No8"],
-    "Grad_No16": ["Validation_Average__Passing_No16"],
-    "Grad_No30": ["Validation_Average__Passing_No30"],
-    "Grad_No50": ["Validation_Average__Passing_No50"],
-    "Grad_No100": ["Validation_Average__Passing_No100"],
-    "Grad_No200": ["Validation_Average__Passing_No200"],
+    "RBR_JMF_percent": ["RBR_percent", "RBR_pct", "RBR_percent_Recalc"],
+    # Full gradation -> canonical Grad_* names used by the SA / gradation-area calcs.
+    "Grad_1_1_2in": ["Validation_Average__Passing_1_1_2in", "Design_Submission__Pass_1_1_2in"],
+    "Grad_1in": ["Validation_Average__Passing_1in", "Design_Submission__Pass_1in"],
+    "Grad_3_4in": ["Validation_Average__Passing_3_4in", "Design_Submission__Pass_3_4in"],
+    "Grad_1_2in": ["Validation_Average__Passing_1_2in", "Design_Submission__Pass_1_2in"],
+    "Grad_3_8in": ["Validation_Average__Passing_3_8in", "Design_Submission__Pass_3_8in"],
+    "Grad_No4": ["Validation_Average__Passing_No4", "Design_Submission__Pass_No_4"],
+    "Grad_No8": ["Validation_Average__Passing_No8", "Design_Submission__Pass_No_8"],
+    "Grad_No16": ["Validation_Average__Passing_No16", "Design_Submission__Pass_No_16"],
+    "Grad_No30": ["Validation_Average__Passing_No30", "Design_Submission__Pass_No_30"],
+    "Grad_No50": ["Validation_Average__Passing_No50", "Design_Submission__Pass_No_50"],
+    "Grad_No100": ["Validation_Average__Passing_No100", "Design_Submission__Pass_No_100"],
+    "Grad_No200": ["Validation_Average__Passing_No200", "Design_Submission__Pass_No_200"],
 }
 
 NUMERIC_HINTS = [
@@ -643,6 +680,8 @@ DROP_ALWAYS = [
     "Aggregate_components_used", "IsLeft", "ADT", "RBR_band",
     "Flag_RBR_out_of_range", "Flag_missing_input",
     "MixTemperature_flag_invalid", "MixTemperature_F", "Additive_Product", "Additive_Rate",
+    "Source_File", "Unified_Mix_ID", "Base_Mix_ID", "Mix_ID", "JMF_Record_Key",
+    "LWT_Design_Extracted", "SCB_Result_Extracted", "LWT_Validation_Rut", "SCB_Jc",
 ]
 
 
@@ -1014,26 +1053,103 @@ if QUICK_SMOKE_TEST:
 # DATA PREP + SPLITTING (80% train with target / 20% locked test)
 # =============================================================================
 
-def load_data() -> Tuple[pd.DataFrame, pd.Series, Path]:
-    path = resolve_file_path(RUT_FILE, RUT_FILE_FALLBACKS)
-    df = read_excel_best_sheet(path)
+def _resolve_named_file(names: List[str]) -> Optional[Path]:
+    """Find the first existing file among `names`, searched in DOWNLOADS, the script folder and cwd."""
+    roots = [DOWNLOADS, Path.cwd()]
+    try:
+        roots.append(Path(__file__).resolve().parent)
+    except Exception:
+        pass
+    for nm in names:
+        p = Path(nm)
+        if p.is_absolute() and p.exists():
+            return p
+        for r in roots:
+            if (r / nm).exists():
+                return r / nm
+    return None
+
+
+def _read_sheet(path: Path, sheets: List[Any]) -> pd.DataFrame:
+    """Read the first matching sheet from `sheets`, else the first sheet."""
+    xls = pd.ExcelFile(path)
+    for s in sheets:
+        if s != 0 and str(s) in xls.sheet_names:
+            print(f"  {path.name}: sheet {s}")
+            return pd.read_excel(path, sheet_name=s)
+    print(f"  {path.name}: first sheet {xls.sheet_names[0]}")
+    return pd.read_excel(path, sheet_name=xls.sheet_names[0])
+
+
+def _harmonize_source(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
+    """Clean columns, rename the target to TARGET, assign a mix ID, and copy alias columns so
+    every source file ends up in the SAME canonical column space before rows are concatenated."""
     df = clean_column_names(df)
-    # ---- Rename the target column to TARGET from whichever alias the file uses ----
     if TARGET not in df.columns:
         for a in TARGET_ALIASES:
             if a in df.columns:
                 if a != TARGET:
                     df = df.rename(columns={a: TARGET})
-                    print(f"Target column {a!r} -> {TARGET!r}")
+                    print(f"    target {a!r} -> {TARGET!r}")
                 break
-    # ---- Provide a mix ID for grouping/averaging from whichever key the file uses ----
     if ID_COL not in df.columns:
         for a in ID_COL_ALIASES:
             if a in df.columns:
-                df[ID_COL] = df[a]
+                df[ID_COL] = df[a].astype(str)
                 break
     df = copy_alias_columns(df)
-    df = create_engineered_columns(df)
+    df["Source_File"] = source_name
+    return df
+
+
+def load_data() -> Tuple[pd.DataFrame, pd.Series, Path]:
+    # ---- Build the list of data sources: primary file first, then the additional ones ----
+    path = resolve_file_path(RUT_FILE, RUT_FILE_FALLBACKS)
+    sources: List[Tuple[Path, List[Any]]] = [(path, SHEET_CANDIDATES)]
+    if COMBINE_ADDITIONAL_FILES:
+        for names, sheets in ADDITIONAL_DATA_SOURCES:
+            p = _resolve_named_file(names)
+            if p is None:
+                print(f"Additional data source not found (skipped): {names[0]}")
+                continue
+            if p.resolve() == path.resolve():
+                continue  # already loaded as the primary
+            sources.append((p, sheets))
+
+    print("Loading data sources:")
+    frames, per_source = [], []
+    for p, sheets in sources:
+        raw = _read_sheet(p, sheets)
+        h = _harmonize_source(raw, p.name)
+        h = create_engineered_columns(h)          # canonical inputs now exist -> engineer per source
+        if TARGET not in h.columns:
+            print(f"    WARNING: no target in {p.name}; skipped.")
+            continue
+        h = h.loc[pd.to_numeric(h[TARGET], errors="coerce").notna()].reset_index(drop=True)
+        frames.append(h)
+        per_source.append((p.name, len(h)))
+    if not frames:
+        raise KeyError(f"No data source produced a usable {TARGET!r} column (tried {TARGET_ALIASES}).")
+
+    # ---- Concatenate (union of columns) and de-duplicate mixes/reports across files ----
+    df = pd.concat(frames, ignore_index=True, sort=False)
+    n_before = len(df)
+    dedup_key = next((k for k in DEDUP_KEYS if k in df.columns), None)
+    if dedup_key is not None:
+        key = df[dedup_key].astype(str)
+        if dedup_key != ID_COL:  # combine identity with the target so distinct results are kept
+            key = key + "|" + pd.to_numeric(df[TARGET], errors="coerce").round(3).astype(str)
+        df = df.loc[~key.duplicated(keep="first")].reset_index(drop=True)
+    else:
+        df = df.drop_duplicates().reset_index(drop=True)
+    n_dupes = n_before - len(df)
+
+    print(f"Combined {len(frames)} source(s): "
+          + ", ".join(f"{nm}={n}" for nm, n in per_source)
+          + f" -> {n_before} rows; removed {n_dupes} duplicate "
+          + (f"mixes/reports (key={dedup_key})" if dedup_key else "rows")
+          + f" -> {len(df)} unique rows.")
+
     if TARGET not in df.columns:
         raise KeyError(f"Target not found (tried {TARGET_ALIASES}). Columns: {list(df.columns)[:40]}")
     # Drop rows with no target BEFORE averaging.
@@ -1074,9 +1190,16 @@ def load_data() -> Tuple[pd.DataFrame, pd.Series, Path]:
     print("\n" + "=" * 100)
     print(f"Loaded {TARGET} data")
     print("=" * 100)
-    print(f"File: {path}")
+    print(f"Primary file: {path}")
+    if "Source_File" in df.columns:
+        print("Rows per source (after dedup): "
+              + ", ".join(f"{s}={n}" for s, n in df["Source_File"].value_counts().items()))
     print(f"Rows: {len(df)} | Columns after engineering: {df.shape[1]}")
     print(f"Replicate averaging: {AVERAGE_REPLICATES} | Log-target: {LOG_TARGET}")
+    if ID_COL in df.columns:
+        print(f"Unique mixes ({ID_COL}): {df[ID_COL].nunique()} of {len(df)} rows"
+              + ("  <-- replicates present; set GROUP_SPLIT_BY_MIX=True or AVERAGE_REPLICATES=True "
+                 "to avoid leakage" if df[ID_COL].nunique() < len(df) else ""))
     has_rbr = "RBR_JMF_fraction" in df.columns
     print(f"True RBR present: {has_rbr}"
           + (f" | RBR_percent mean={df['RBR_JMF_percent'].mean():.2f}" if "RBR_JMF_percent" in df.columns else ""))
