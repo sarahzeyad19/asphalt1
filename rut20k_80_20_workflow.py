@@ -290,6 +290,19 @@ AUTO_SELECT_METRIC = "TrainOOF_R2"
 # Models that shap.TreeExplainer can explain (so SHAP/PDP run on the selected model).
 # StackingRegressor and HistGradientBoosting are excluded (TreeExplainer cannot handle them).
 SHAP_CAPABLE_MODELS = ["XGBoost", "LightGBM", "CatBoost", "RandomForest", "ExtraTrees", "GradientBoostingHuber"]
+# ---- Clean-SHAP option -----------------------------------------------------------------------
+# ExtraTrees / RandomForest are BAGGED, deeply-grown randomized trees. They predict well, but
+# their SHAP beeswarm looks muddy: high (red) and low (blue) feature values overlap because the
+# attributions are non-monotonic and split arbitrarily among correlated features. GRADIENT-BOOSTED
+# models (XGBoost / LightGBM / CatBoost) give clean, monotonic, well-separated SHAP colors.
+# When True, the final SHAP-explained model is chosen ONLY among gradient boosters, so the SHAP
+# plots are interpretable (tiny cost in CV R2 vs the bagging models). Set False to keep the raw
+# highest-CV model (which may be ExtraTrees) for the explanation.
+SHAP_PREFER_BOOSTER = True
+SHAP_BOOSTER_MODELS = ["XGBoost", "LightGBM", "CatBoost", "GradientBoostingHuber"]
+# Explain SHAP on the FULL data sample (train + test) instead of only the small locked-test slice,
+# so the beeswarm has enough points to be representative.
+SHAP_EXPLAIN_ON_ALL_ROWS = True
 
 # ---- FORCE a specific final model (used only when AUTO_SELECT_HIGHEST_VALIDATION = False) ----
 # Set both to None to fall back to automatic robust-score selection.
@@ -2908,12 +2921,19 @@ def main():
     if AUTO_SELECT_HIGHEST_VALIDATION:
         # honest CV score among SHAP-capable single models (keeps SHAP/PDP working)
         sort_col = AUTO_SELECT_METRIC if AUTO_SELECT_METRIC in results_df.columns else "Validation_R2"
-        cand = results_df[results_df["Model"].isin(SHAP_CAPABLE_MODELS)].sort_values(
-            sort_col, ascending=False)
+        # SHAP_PREFER_BOOSTER: restrict to gradient boosters so the final SHAP beeswarm is clean
+        # (ExtraTrees/RandomForest give muddy, non-monotonic SHAP colours). Falls back to all
+        # SHAP-capable models if no booster finished.
+        allowed = SHAP_BOOSTER_MODELS if SHAP_PREFER_BOOSTER else SHAP_CAPABLE_MODELS
+        cand = results_df[results_df["Model"].isin(allowed)].sort_values(sort_col, ascending=False)
+        if cand.empty and SHAP_PREFER_BOOSTER:
+            cand = results_df[results_df["Model"].isin(SHAP_CAPABLE_MODELS)].sort_values(
+                sort_col, ascending=False)
         if not cand.empty:
             selected = cand.iloc[0]
-            print(f"\nFinal model AUTO-SELECTED by HIGHEST {sort_col} (SHAP-capable, honest CV): "
-                  f"{selected['Label']} ({sort_col}={selected[sort_col]:.4f}, "
+            print(f"\nFinal model AUTO-SELECTED by HIGHEST {sort_col} "
+                  f"({'gradient booster for clean SHAP' if SHAP_PREFER_BOOSTER else 'SHAP-capable'}, "
+                  f"honest CV): {selected['Label']} ({sort_col}={selected[sort_col]:.4f}, "
                   f"Validation R2={selected['Validation_R2']:.4f})")
     if selected is None and FORCE_FINAL_FEATURE_SET and FORCE_FINAL_MODEL:
         forced_label = f"{FORCE_FINAL_FEATURE_SET} | {FORCE_FINAL_MODEL}"
@@ -2977,6 +2997,15 @@ def main():
                 band_split_idx[OOF_SPLIT_NAME] = train_idx
             ad_targets = ([(OOF_SPLIT_NAME, train_idx)] if oof_pred_rows is not None else []) + \
                          [(TEST_SPLIT_NAME, test_idx)]
+        if SHAP_EXPLAIN_ON_ALL_ROWS:
+            # Representative beeswarm: explain on ALL rows (train + test), not just the small
+            # locked-test slice, so the SHAP colours are dense enough to read.
+            X_explain = pd.concat([obj["X_train"], obj["X_test"]], axis=0).reset_index(drop=True)
+            explain_pred = pd.concat(
+                [final_pred_df[final_pred_df["Dataset"] == TRAIN_SPLIT_NAME],
+                 final_pred_df[final_pred_df["Dataset"] == TEST_SPLIT_NAME]], ignore_index=True)
+            band_explain = pd.concat([band_series_full.iloc[train_idx], band_series_full.iloc[test_idx]],
+                                     axis=0).reset_index(drop=True)
         metrics_sheet = "Final_TrainValTest_Metrics" if HAS_VAL_HOLDOUT else "Final_TrainTest_Metrics"
         workbook_name = f"Rut20k_v3_{SPLIT_TAG}_WITH_LOCKED_TEST_Results.xlsx"
     else:
