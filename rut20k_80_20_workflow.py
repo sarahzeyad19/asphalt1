@@ -188,7 +188,12 @@ except Exception:
 
 RANDOM_STATE = 42
 TARGET = "Rut_20k"
+# Target column aliases: the LaPave validation workbook stores the rut target as
+# "LWT_Validation_Rut"; the older files use "Rut_20k". The first present column is renamed
+# to TARGET in load_data so the same script runs on every file.
+TARGET_ALIASES = ["Rut_20k", "LWT_Validation_Rut", "LWT_Rut", "Rut_Value", "Rutting"]
 ID_COL = "MixDesignKey"
+ID_COL_ALIASES = [ID_COL, "Mix_ID", "JMF_Record_Key", "JMF_Number"]
 
 # ---- DATA SPLIT (requested: 80% training WITH the target / 20% locked test) ----
 # VALIDATION_SIZE = 0 means NO separate validation holdout: the model trains on the full 80%
@@ -418,16 +423,18 @@ if not DOWNLOADS.exists():
 # Dust_Pbe_ratio, SurfaceArea_m2kg, Grad_* gradation, additives), sheet "RUT". The older
 # Rutting_Cleaned_with_RBR.xlsx stays as a fallback — missing physics columns are recomputed
 # from the equations sheet formulas where possible.
-RUT_FILENAME = "LWT__SCB_CLEANED.xlsx"
+RUT_FILENAME = "LaPave_Validation_Full_Matched_RUT_SCB.xlsx"
 RUT_FILE = DOWNLOADS / RUT_FILENAME
 RUT_FILE_FALLBACKS = [
+    DOWNLOADS / "LWT__SCB_CLEANED.xlsx",
     DOWNLOADS / "LWT__SCB_CLEANED (1).xlsx",
     DOWNLOADS / "Rutting_Cleaned_with_RBR.xlsx",
     DOWNLOADS / "Rutting_Cleaned_with_RBR (1).xlsx",
     DOWNLOADS / "Rutting_Cleaned_SpecBased.xlsx",
 ]
-SHEET_CANDIDATES = ["RUT", "LWT_Clean_Modeling", "Cleaned_With_RBR", "Cleaned_Dataset",
-                    "Cleaned_Data_Kept", "Sheet1", 0]
+# RUT_Full_Mixes = the rut target sheet in the LaPave workbook; earlier names kept as fallbacks.
+SHEET_CANDIDATES = ["RUT_Full_Mixes", "RUT", "LWT_Clean_Modeling", "Cleaned_With_RBR",
+                    "Cleaned_Dataset", "Cleaned_Data_Kept", "Sheet1", 0]
 
 OUTPUT_FOLDER = DOWNLOADS / f"Rut20k_v3_{SPLIT_TAG}_RBR_outputs"
 
@@ -517,11 +524,13 @@ def resolve_file_path(path: Path, fallbacks: List[Path]) -> Path:
     try:
         script_dir = Path(__file__).resolve().parent
         candidates += [script_dir / p.name for p in list(candidates)]
+        candidates += list(script_dir.glob("*LaPave_Validation*Matched*RUT*SCB*.xlsx"))
         candidates += list(script_dir.glob("*LWT__SCB_CLEANED*.xlsx"))
         candidates += list(script_dir.glob("*Rutting_Cleaned_with_RBR*.xlsx"))
     except Exception:
         pass
     candidates += [Path.cwd() / p.name for p in list(candidates)]
+    candidates += list(Path.cwd().glob("*LaPave_Validation*Matched*RUT*SCB*.xlsx"))
     candidates += list(Path.cwd().glob("*LWT__SCB_CLEANED*.xlsx"))
     candidates += list(Path.cwd().glob("*Rutting_Cleaned_with_RBR*.xlsx"))
     seen, out = set(), []
@@ -532,9 +541,9 @@ def resolve_file_path(path: Path, fallbacks: List[Path]) -> Path:
         if p.exists():
             return p
     raise FileNotFoundError(
-        "Could not find the data Excel file. Put 'LWT__SCB_CLEANED.xlsx' (preferred) or "
-        "'Rutting_Cleaned_with_RBR.xlsx' in your Downloads folder or next to this script. "
-        "Tried:\n" + "\n".join(str(p) for p in candidates[:12])
+        "Could not find the data Excel file. Put 'LaPave_Validation_Full_Matched_RUT_SCB.xlsx' "
+        "(preferred), 'LWT__SCB_CLEANED.xlsx', or 'Rutting_Cleaned_with_RBR.xlsx' in your "
+        "Downloads folder or next to this script. Tried:\n" + "\n".join(str(p) for p in candidates[:12])
     )
 
 
@@ -558,22 +567,53 @@ def read_excel_best_sheet(path: Path) -> pd.DataFrame:
 # =============================================================================
 
 ALIASES = {
-    "AsphaltContent_Design": ["AC_design", "AC_Design", "AsphaltContentDesign", "Design_AC"],
-    # In the LWT__SCB_CLEANED workbook the sieve columns are Grad_No4 (4.75 mm) / Grad_No200 (0.075 mm).
-    "Pass4_75mm": ["P4.75", "P4_75", "Pass_4_75mm", "Passing_4.75mm", "Grad_No4"],
-    "Pass0_075mm": ["P0.075", "P0_075", "Pass_0_075mm", "Passing_0.075mm", "Grad_No200"],
-    "NMAS (mm)": ["NMAS", "NMAS_mm", "NMAS(mm)"],
-    "PG_HighTemp": ["PG High", "PG_High", "PGHigh", "PG_High_Temp"],
+    # LaPave workbook stores volumetrics under "Validation_Average__*" and aggregate properties
+    # under "Combined_Aggregate_*"; gradation under "Validation_Average__Passing_*".
+    "AsphaltContent_Design": ["AC_design", "AC_Design", "AsphaltContentDesign", "Design_AC",
+                              "Validation_Average__Asphalt_Content"],
+    # Sieve columns: LWT file uses Grad_No4/Grad_No200; LaPave uses Validation_Average__Passing_No4/No200.
+    "Pass4_75mm": ["P4.75", "P4_75", "Pass_4_75mm", "Passing_4.75mm", "Grad_No4",
+                   "Validation_Average__Passing_No4"],
+    "Pass0_075mm": ["P0.075", "P0_075", "Pass_0_075mm", "Passing_0.075mm", "Grad_No200",
+                    "Validation_Average__Passing_No200"],
+    "NMAS (mm)": ["NMAS", "NMAS_mm", "NMAS(mm)"],  # LaPave: parsed from Nominal_Aggregate_Size (text)
+    "PG_HighTemp": ["PG High", "PG_High", "PGHigh", "PG_High_Temp"],  # LaPave: parsed from PG_Grade_Normalized
     "RAP_pct": ["RAP", "RAP%", "RAP_Percent", "RAP_Pct"],
     "ACinRAP": ["AC_in_RAP", "AC_RAP", "ACin_RAP"],
     "Dust_Binder": ["DustBinder", "Dust_to_Binder", "Dust/Binder"],
-    "SandEq": ["Sand_Equivalent", "SandEQ", "SE"],
+    "SandEq": ["Sand_Equivalent", "SandEQ", "SE", "Combined_Aggregate_Sand_Equivalent"],
+    "FAA": ["Combined_Aggregate_FAA"],
+    "CAA": ["Combined_Aggregate_CAA"],
+    "Absorption": ["Combined_Aggregate_Absorption"],
+    "VMA": ["Validation_Average__VMA"],
+    "VFA": ["Validation_Average__VFA"],
+    "Va": ["Air_Voids", "AirVoids", "Validation_Average__Air_Voids"],
+    "Gmm": ["Validation_Average__Gmm"],
+    "Gmb": ["Validation_Average__Gmb"],
+    "Gsb": ["Combined_Aggregate_Bulk_Gravity"],
+    "Gse": ["Validation_Average__Gse"],
+    "Pba_pct": ["Validation_Average__Pba"],
+    "Pbe_pct": ["Validation_Average__Pbe"],
+    "Dust_Pbe_ratio": ["Validation_Average__Dust_to_Effective_Binder", "Dust_to_Effective_Binder"],
     "DesignLev": ["DesignLevel", "Design_Level", "TrafficLevel"],
     "MixType": ["Mix_Type", "Mixture_Type", "Type"],
-    "RAP_Class": ["RAPClass", "RAP class", "RAP_Classification"],
+    "RAP_Class": ["RAPClass", "RAP class", "RAP_Classification", "RBR_Band", "RBR_band"],
+    "Has_Additive": ["Has_Antistrip"],
+    "Additive_Type": ["Antistrip_Type", "Additive_Type_clean"],
     # RBR from the cleaned file.
     "RBR_JMF_fraction": ["RBR_decimal", "RBR_fraction", "RBR"],
     "RBR_JMF_percent": ["RBR_percent", "RBR_pct"],
+    # Full gradation: map LaPave Passing_* to the canonical Grad_* names used by the SA / area calcs.
+    "Grad_3_4in": ["Validation_Average__Passing_3_4in"],
+    "Grad_1_2in": ["Validation_Average__Passing_1_2in"],
+    "Grad_3_8in": ["Validation_Average__Passing_3_8in"],
+    "Grad_No4": ["Validation_Average__Passing_No4"],
+    "Grad_No8": ["Validation_Average__Passing_No8"],
+    "Grad_No16": ["Validation_Average__Passing_No16"],
+    "Grad_No30": ["Validation_Average__Passing_No30"],
+    "Grad_No50": ["Validation_Average__Passing_No50"],
+    "Grad_No100": ["Validation_Average__Passing_No100"],
+    "Grad_No200": ["Validation_Average__Passing_No200"],
 }
 
 NUMERIC_HINTS = [
@@ -624,6 +664,61 @@ def copy_alias_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def parse_pg_high_temp(value: Any) -> float:
+    """High-temperature PG number from a grade string, e.g. 'PG 70-22' -> 70, 'PG 76-22M' -> 76.
+    Returns NaN for 'PG grade not normalized' and other unparseable values."""
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    m = re.search(r"(?i)PG\s*(\d{2,3})\s*[-–]\s*(-?\d{1,3})", str(value))
+    if m:
+        return float(m.group(1))
+    m = re.search(r"\b(\d{2,3})\s*[-–]\s*-?\d{1,3}\b", str(value))
+    return float(m.group(1)) if m else np.nan
+
+
+_NMAS_TEXT_TO_MM = {"1 1/2": 37.5, "1-1/2": 37.5, "1.5": 37.5, "1 in": 25.0, "1in": 25.0,
+                    "3/4": 19.0, "1/2": 12.5, "3/8": 9.5, "1": 25.0}
+
+
+def parse_nmas_to_mm(value: Any) -> float:
+    """NMAS in mm from text like '3/4 in.' -> 19.0, '1 in.' -> 25.0, '1/2 in.' -> 12.5.
+    A bare number is treated as already-mm when plausible (<=50)."""
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        v = float(value)
+        return v if v <= 50 else np.nan
+    s = str(value).lower().replace("in.", "").replace("inch", "").replace("in", "").strip()
+    if s in _NMAS_TEXT_TO_MM:
+        return _NMAS_TEXT_TO_MM[s]
+    m = re.match(r"^\s*(\d+)\s+(\d+)/(\d+)", s)      # mixed fraction e.g. "1 1/2"
+    if m:
+        inches = float(m.group(1)) + float(m.group(2)) / float(m.group(3))
+        return round(inches * 25.4, 1)
+    m = re.match(r"^\s*(\d+)/(\d+)", s)              # simple fraction e.g. "3/4"
+    if m:
+        return round(float(m.group(1)) / float(m.group(2)) * 25.4, 1)
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)", s)          # decimal inches or mm
+    if m:
+        v = float(m.group(1))
+        return round(v * 25.4, 1) if v <= 3 else v   # <=3 -> inches, else already mm
+    return np.nan
+
+
+def normalize_yes_no(value: Any) -> Any:
+    """'Yes'/'No' -> 1/0; pass numeric through; anything else -> as-is (for categorical use)."""
+    if pd.isna(value):
+        return np.nan
+    s = str(value).strip().lower()
+    if s in ("yes", "y", "true", "1"):
+        return 1
+    if s in ("no", "n", "false", "0", "no antistrip listed in jmf"):
+        return 0
+    return value
+
+
 def parse_adt_to_ordinal(value: Any) -> float:
     if pd.isna(value):
         return np.nan
@@ -654,6 +749,20 @@ def create_engineered_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     if "ADT" in df.columns and "ADT_DOTD_ord" not in df.columns:
         df["ADT_DOTD_ord"] = df["ADT"].apply(parse_adt_to_ordinal)
+
+    # ---- LaPave text columns -> numeric canonical inputs ----
+    if "PG_HighTemp" not in df.columns:
+        for src in ["PG_Grade_Normalized", "PG_Grade"]:
+            if src in df.columns:
+                df["PG_HighTemp"] = df[src].apply(parse_pg_high_temp)
+                break
+    if "NMAS (mm)" not in df.columns and "Nominal_Aggregate_Size" in df.columns:
+        df["NMAS (mm)"] = df["Nominal_Aggregate_Size"].apply(parse_nmas_to_mm)
+    if "Has_Additive" in df.columns:
+        df["Has_Additive"] = df["Has_Additive"].apply(normalize_yes_no)
+    if "MixTemperature_F_clean" not in df.columns and "Mix_Temperature" in df.columns:
+        t = pd.to_numeric(df["Mix_Temperature"], errors="coerce")
+        df["MixTemperature_F_clean"] = t.where((t >= 250) & (t <= 375))  # implausible -> blank
 
     if {"RAP_pct", "ACinRAP"}.issubset(df.columns):
         df["RAP_pct_x_ACinRAP"] = pd.to_numeric(df["RAP_pct"], errors="coerce") * pd.to_numeric(df["ACinRAP"], errors="coerce")
@@ -909,10 +1018,24 @@ def load_data() -> Tuple[pd.DataFrame, pd.Series, Path]:
     path = resolve_file_path(RUT_FILE, RUT_FILE_FALLBACKS)
     df = read_excel_best_sheet(path)
     df = clean_column_names(df)
+    # ---- Rename the target column to TARGET from whichever alias the file uses ----
+    if TARGET not in df.columns:
+        for a in TARGET_ALIASES:
+            if a in df.columns:
+                if a != TARGET:
+                    df = df.rename(columns={a: TARGET})
+                    print(f"Target column {a!r} -> {TARGET!r}")
+                break
+    # ---- Provide a mix ID for grouping/averaging from whichever key the file uses ----
+    if ID_COL not in df.columns:
+        for a in ID_COL_ALIASES:
+            if a in df.columns:
+                df[ID_COL] = df[a]
+                break
     df = copy_alias_columns(df)
     df = create_engineered_columns(df)
     if TARGET not in df.columns:
-        raise KeyError(f"Target {TARGET!r} not found. Columns: {list(df.columns)[:30]}")
+        raise KeyError(f"Target not found (tried {TARGET_ALIASES}). Columns: {list(df.columns)[:40]}")
     # Drop rows with no target BEFORE averaging.
     df = df.loc[pd.to_numeric(df[TARGET], errors="coerce").notna()].reset_index(drop=True)
 
