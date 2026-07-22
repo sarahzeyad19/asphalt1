@@ -474,6 +474,16 @@ ADDITIONAL_DATA_SOURCES = [
 ]
 # De-duplication key priority when merging files (first present wins).
 DEDUP_KEYS = ["JMF_Record_Key", "Mix_ID", "Unified_Mix_ID"]
+# Content-based dedup (leakage guard): collapse the SAME physical mix reported in two files under
+# different IDs (identical modelling features + target). Strongly recommended for publication --
+# without it, identical mixes can land in both train and test even though the mix IDs differ.
+DEDUP_BY_FEATURE_SIGNATURE = True
+FEATURE_SIGNATURE_COLS = [
+    "PG_HighTemp", "RBR_JMF_fraction", "Va", "VMA", "VFA", "Gmm", "Gmb", "Gsb", "Gse",
+    "Pbe_pct", "AFT_micron", "Dust_Pbe_ratio", "ACinRAP", "RAP_pct", "Absorption", "SandEq",
+    "FAA", "CAA", "Pass4_75mm", "Pass0_075mm", "NMAS (mm)", "AsphaltContent_Design",
+    "SurfaceArea_m2kg",
+]
 
 OUTPUT_FOLDER = DOWNLOADS / f"Rut20k_v3_{SPLIT_TAG}_RBR_outputs"
 
@@ -1157,10 +1167,31 @@ def load_data() -> Tuple[pd.DataFrame, pd.Series, Path]:
         df = df.drop_duplicates().reset_index(drop=True)
     n_dupes = n_before - len(df)
 
+    # ---- CONTENT-BASED de-duplication (leakage guard) ----
+    # ID-based dedup does NOT catch the SAME physical mix reported in two files under DIFFERENT
+    # IDs. Those rows have identical modelling features + target, so ID-grouping would still split
+    # them across train/test -> leakage. Here we collapse rows that are byte-for-byte identical on
+    # the physical modelling columns + target, and assign every identical mix a SHARED group id.
+    n_content = 0
+    if DEDUP_BY_FEATURE_SIGNATURE:
+        sig_cols = [c for c in FEATURE_SIGNATURE_COLS if c in df.columns]
+        if len(sig_cols) >= 5:
+            sig = pd.Series(["|".join(map(str, row)) for row in df[sig_cols].round(4).values], index=df.index)
+            sig_key = sig + "|" + pd.to_numeric(df[TARGET], errors="coerce").round(4).astype(str)
+            df["_content_group"] = sig_key.factorize()[0].astype(str)
+            before_c = len(df)
+            df = df.loc[~sig_key.duplicated(keep="first")].reset_index(drop=True)
+            n_content = before_c - len(df)
+            if ID_COL in df.columns:
+                df[ID_COL] = df["_content_group"].values
+            df = df.drop(columns=["_content_group"])
+    n_dupes = n_before - len(df)
+
     print(f"Combined {len(frames)} source(s): "
           + ", ".join(f"{nm}={n}" for nm, n in per_source)
-          + f" -> {n_before} rows; removed {n_dupes} duplicate "
-          + (f"mixes/reports (key={dedup_key})" if dedup_key else "rows")
+          + f" -> {n_before} rows; removed {n_dupes} duplicate rows "
+          + (f"(ID key={dedup_key}" if dedup_key else "(")
+          + (f" + {n_content} same-mix-different-ID by feature signature)" if n_content else ")")
           + f" -> {len(df)} unique rows.")
 
     if TARGET not in df.columns:
