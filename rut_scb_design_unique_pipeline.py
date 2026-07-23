@@ -25,6 +25,19 @@ from pathlib import Path
 import numpy as np, pandas as pd
 warnings.filterwarnings("ignore")
 
+import matplotlib
+# Pop-out plot windows when run as a plain .py; set to "Agg" only on a headless server.
+try:
+    matplotlib.use("TkAgg")
+except Exception:
+    pass
+import matplotlib.pyplot as plt
+try:
+    import shap; HAS_SHAP = True
+except Exception:
+    HAS_SHAP = False
+SHOW_PLOTS = True      # display every figure; also saved to the outputs folder
+
 from sklearn.base import clone
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
@@ -52,6 +65,8 @@ DOWNLOADS=Path(r"C:\Users\lenovo\Downloads")
 if not DOWNLOADS.exists():
     DOWNLOADS = HOME/"Downloads" if (HOME/"Downloads").exists() else Path.cwd()
 DATA="updated data extraction.xlsx"
+OUT=DOWNLOADS/"Rut_SCB_DesignUnique_outputs"/"figures"
+OUT.mkdir(parents=True, exist_ok=True)
 
 CATEG=["MixType","DesignLev"]
 RENAME={"Design_Submission__Percent_Voids":"Va","Design_Submission__VMA":"VMA","Design_Submission__VFA":"VFA",
@@ -169,6 +184,61 @@ def split_groups(y,groups):
     dev,te=next(iter(StratifiedGroupKFold(max(2,round(1/TEST_SIZE)),shuffle=True,random_state=RANDOM_STATE).split(np.zeros(len(y)),b,groups)))
     return dev,te
 
+def _save(fig_name):
+    p=OUT/fig_name; plt.tight_layout(); plt.savefig(p,dpi=200,bbox_inches="tight")
+    if SHOW_PLOTS:
+        try: plt.show()
+        except Exception: pass
+    plt.close()
+
+def plot_best_fit(ytr,ptr,yte,pte,target,gname):
+    unit="mm" if target=="Rut_20k" else ""
+    for split,ya,yp in [("Train",ytr,ptr),("LockedTest",yte,pte)]:
+        ya=np.asarray(ya,float); yp=np.asarray(yp,float); m=M(ya,yp); sl,ic=np.polyfit(ya,yp,1)
+        plt.figure(figsize=(6,5.6)); plt.scatter(ya,yp,alpha=0.55,s=20)
+        lo,hi=float(min(ya.min(),yp.min())),float(max(ya.max(),yp.max())); xs=np.linspace(lo,hi,100)
+        plt.plot([lo,hi],[lo,hi],"--",lw=2,label="Ideal 1:1"); plt.plot(xs,sl*xs+ic,lw=2,label=f"Fit y={sl:.2f}x+{ic:.2f}")
+        plt.xlabel(f"Measured {target} {unit}"); plt.ylabel(f"Predicted {target} {unit}")
+        plt.title(f"{target} {split} — {gname}\nR2={m['R2']:.3f} RMSE={m['RMSE']:.3f} MAE={m['MAE']:.3f}")
+        plt.legend(); plt.grid(alpha=0.3); _save(f"{target}_{gname.split()[0]}_{split}_bestfit.png")
+
+def plot_residuals(yte,pte,target,gname):
+    yte=np.asarray(yte,float); res=np.asarray(pte,float)-yte
+    plt.figure(figsize=(6,5)); plt.scatter(pte,res,alpha=0.55,s=20); plt.axhline(0,ls="--",lw=2)
+    plt.xlabel(f"Predicted {target}"); plt.ylabel("Residual (pred - meas)")
+    plt.title(f"{target} residuals — {gname}"); plt.grid(alpha=0.3); _save(f"{target}_{gname.split()[0]}_residuals.png")
+
+def plot_importance(fitted,num,cat,target,gname):
+    try:
+        model=fitted.named_steps["model"]; names=list(fitted.named_steps["prep"].get_feature_names_out())
+        imp=getattr(model,"feature_importances_",None)
+        if imp is None: return
+        s=pd.Series(imp,index=names).sort_values(ascending=False).head(18)[::-1]
+        plt.figure(figsize=(7,max(4,len(s)*0.32))); plt.barh(s.index,s.values)
+        plt.xlabel("Feature importance"); plt.title(f"{target} importance — {gname}"); plt.grid(axis="x",alpha=0.3)
+        _save(f"{target}_{gname.split()[0]}_importance.png")
+    except Exception as e: print("    importance plot skipped:",e)
+
+def plot_quantile(yte,q10,q50,q90,target,gname):
+    order=np.argsort(np.asarray(yte,float)); yv=np.asarray(yte,float)[order]
+    plt.figure(figsize=(7.5,5)); xs=np.arange(len(yv))
+    plt.fill_between(xs,np.asarray(q10)[order],np.asarray(q90)[order],alpha=0.25,label="80% interval (P10-P90)")
+    plt.plot(xs,np.asarray(q50)[order],lw=1.5,label="Median (P50)")
+    plt.scatter(xs,yv,s=14,color="k",label="Measured",zorder=5)
+    plt.xlabel("Test mixes (sorted by measured)"); plt.ylabel(target)
+    plt.title(f"{target} quantile uncertainty band — {gname}"); plt.legend(); plt.grid(alpha=0.3)
+    _save(f"{target}_{gname.split()[0]}_quantile_band.png")
+
+def plot_shap(fitted,Xt,target,gname):
+    if not HAS_SHAP: return
+    try:
+        pre=fitted.named_steps["prep"]; model=fitted.named_steps["model"]
+        Xtt=pre.transform(Xt); names=list(pre.get_feature_names_out())
+        sv=shap.TreeExplainer(model)(Xtt)
+        plt.figure(); shap.summary_plot(sv.values,Xtt,feature_names=names,show=False,max_display=16)
+        _save(f"{target}_{gname.split()[0]}_shap_beeswarm.png")
+    except Exception as e: print("    SHAP skipped:",e)
+
 def run(target_name, sheet, target_col, feats):
     print("\n"+"#"*88+f"\n{target_name}\n"+"#"*88)
     d=load(sheet,target_col,target_name)
@@ -194,8 +264,13 @@ def run(target_name, sheet, target_col, feats):
         bname,bpipe=best; fin=clone(bpipe)
         try: fin.fit(Xd,yd,model__sample_weight=wd)
         except Exception: fin.fit(Xd,yd)
-        tm=M(yt,fin.predict(Xt))
+        pte=fin.predict(Xt); tm=M(yt,pte)
         print(f"    BEST={bname} | dev grouped-CV R2={bestoof:.3f} | LOCKED-TEST R2={tm['R2']:.3f} RMSE={tm['RMSE']:.3f} MAE={tm['MAE']:.3f}")
+        # ---- plots for this grouping ----
+        plot_best_fit(yd,fin.predict(Xd),yt,pte,target_name,gname)
+        plot_residuals(yt,pte,target_name,gname)
+        plot_importance(fin,num,cat,target_name,gname)
+        plot_shap(fin,Xt,target_name,gname)
         # 10/50/90 quantile uncertainty band (GradientBoosting) on the primary grouping only
         if gname.startswith("Base-Mix"):
             try:
@@ -206,7 +281,9 @@ def run(target_name, sheet, target_col, feats):
                 cover=float(np.mean((yt.values>=qp[0.1])&(yt.values<=qp[0.9])))
                 width=float(np.mean(qp[0.9]-qp[0.1]))
                 print(f"    Quantile band: 80% PI coverage={cover:.2f} (target 0.80), mean width={width:.2f} {'mm' if target_name=='Rut_20k' else ''}")
+                plot_quantile(yt,qp[0.1],qp[0.5],qp[0.9],target_name,gname)
             except Exception as e: print("    quantile band failed:",e)
+    print(f"\n  Figures saved to: {OUT}")
 
 def main():
     run("Rut_20k","Rutting_Design","LWT_Design_Result",RUT_FEATURES)
