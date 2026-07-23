@@ -98,7 +98,9 @@ def engineer(df):
 
 def make_clusters(df):
     """DBSCAN engineering clusters within MixType + NMAS blocks (standardized features)."""
-    cid = np.full(len(df), -1, dtype=object); nxt = 0
+    # init every row to its own singleton cluster (string), so any row not touched by DBSCAN
+    # still gets a valid, unique group id.
+    cid = np.array([f"Cinit_{i}" for i in range(len(df))], dtype=object); nxt = 0
     feats = [c for c in CLUSTER_FEATS if c in df.columns]
     nmas_bin = pd.cut(nz(df,"NMAS (mm)"), bins=[0,10,13,20,100], labels=["9.5","12.5","19","25+"]).astype(str)
     blk = df.get("MixType","NA").astype(str) + "|" + nmas_bin
@@ -147,6 +149,7 @@ def pipe(est, num, cat):
     return Pipeline([("prep", ColumnTransformer(t)), ("model", est)])
 
 def gsplit(y, groups):
+    groups = np.asarray([str(g) for g in groups])   # uniform string groups (avoid mixed-type errors)
     b = pd.qcut(y, 5, labels=False, duplicates="drop")
     dev, te = next(iter(StratifiedGroupKFold(max(2,round(1/TEST_SIZE)),shuffle=True,random_state=RANDOM_STATE).split(np.zeros(len(y)), b, groups)))
     vb, vg = b.iloc[dev].values, groups[dev]
