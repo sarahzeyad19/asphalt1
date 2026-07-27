@@ -28,29 +28,23 @@ except Exception: HAS_XGB=False
 
 from mixture_unique_model import collapse_unique, build_X, num, TARGETS
 
-RANDOM=42; N_ITER=25; CV=5
+RANDOM=42; N_ITER=15; CV=4          # leaner: search is n_jobs=-1, estimators n_jobs=1
 PROXY=["AC_Correction_Factor","Production_Rate","Adjustment_Factor"]
 
 def reg_search_space():
     sp={}
-    sp["LightGBM"]=(lgb.LGBMRegressor(random_state=RANDOM,n_jobs=-1,verbose=-1),
-        dict(n_estimators=randint(300,900), learning_rate=uniform(0.01,0.06),
-             num_leaves=randint(15,48), min_child_samples=randint(15,45),
+    sp["LightGBM"]=(lgb.LGBMRegressor(random_state=RANDOM,n_jobs=1,verbose=-1),
+        dict(n_estimators=randint(250,600), learning_rate=uniform(0.02,0.05),
+             num_leaves=randint(15,40), min_child_samples=randint(15,45),
              subsample=uniform(0.6,0.35), colsample_bytree=uniform(0.5,0.45),
-             reg_alpha=uniform(0,3), reg_lambda=uniform(0.5,4), max_depth=randint(3,7)))
-    sp["ExtraTrees"]=(ExtraTreesRegressor(random_state=RANDOM,n_jobs=-1),
-        dict(n_estimators=randint(300,700), min_samples_leaf=randint(4,25),
-             max_features=uniform(0.4,0.5), max_depth=randint(6,20)))
+             reg_alpha=uniform(0,3), reg_lambda=uniform(0.5,4), max_depth=randint(3,6)))
+    sp["ExtraTrees"]=(ExtraTreesRegressor(random_state=RANDOM,n_jobs=1),
+        dict(n_estimators=randint(200,400), min_samples_leaf=randint(4,25),
+             max_features=uniform(0.4,0.5), max_depth=randint(6,18)))
     sp["HistGB"]=(HistGradientBoostingRegressor(random_state=RANDOM),
-        dict(max_iter=randint(300,800), learning_rate=uniform(0.01,0.06),
-             max_leaf_nodes=randint(15,48), min_samples_leaf=randint(15,45),
-             l2_regularization=uniform(0,3), max_depth=randint(3,7)))
-    if HAS_XGB:
-        sp["XGBoost"]=(xgb.XGBRegressor(random_state=RANDOM,n_jobs=-1,verbosity=0),
-            dict(n_estimators=randint(300,900), learning_rate=uniform(0.01,0.06),
-                 max_depth=randint(3,7), subsample=uniform(0.6,0.35),
-                 colsample_bytree=uniform(0.5,0.45), reg_alpha=uniform(0,3),
-                 reg_lambda=uniform(0.5,4), min_child_weight=randint(2,8)))
+        dict(max_iter=randint(250,600), learning_rate=uniform(0.02,0.05),
+             max_leaf_nodes=randint(15,40), min_samples_leaf=randint(15,45),
+             l2_regularization=uniform(0,3), max_depth=randint(3,6)))
     return sp
 
 def prep(df,cfg,drop_proxy=False):
@@ -74,12 +68,15 @@ def evaluate(X,y,log=False,label=""):
     inv=(lambda p: np.expm1(p)) if log else (lambda p: p)
     skf=KFold(CV,shuffle=True,random_state=RANDOM)
     tuned={}; testp={}
+    print(f"\n  [{label}]  n={len(y)}  feats={X.shape[1]}  (test n={len(te)})",flush=True)
     for nm,(est,dist) in reg_search_space().items():
         rs=RandomizedSearchCV(est,dist,n_iter=N_ITER,cv=skf,scoring="r2",
                               random_state=RANDOM,n_jobs=-1,refit=True)
         rs.fit(X.iloc[tr],yfit[tr])
         tuned[nm]=(rs.best_score_, rs.best_estimator_)
         testp[nm]=inv(rs.best_estimator_.predict(X.iloc[te]))
+        print(f"      {nm:11s} tunedCV={rs.best_score_:.3f}  "
+              f"TEST R2={r2_score(y[te],testp[nm]):.3f}",flush=True)
     # equal-weight blend of tuned models
     blend=np.mean([testp[k] for k in testp],axis=0)
     rows=[]
@@ -91,10 +88,9 @@ def evaluate(X,y,log=False,label=""):
     rows.append(("BLEND",np.nan,r2_score(y[te],blend),
                  np.sqrt(mean_squared_error(y[te],blend)),mean_absolute_error(y[te],blend)))
     best=max(rows,key=lambda r:r[2])
-    print(f"\n  [{label}]  n={len(y)}  feats={X.shape[1]}  (test n={len(te)})")
-    for nm,cvs,r2,rmse,mae in rows:
-        star=" *" if nm==best[0] else ""
-        print(f"      {nm:11s} tunedCV(r2,transf)={cvs:.3f}  TEST R2={r2:.3f}  RMSE={rmse:.3f}  MAE={mae:.3f}{star}")
+    br=[r for r in rows if r[0]==best[0]][0]
+    print(f"      {'BLEND':11s}            TEST R2={rows[-1][2]:.3f}  RMSE={rows[-1][3]:.3f}",flush=True)
+    print(f"      -> best: {best[0]}  TEST R2={best[2]:.3f}  RMSE={best[3]:.3f}  MAE={best[4]:.3f}",flush=True)
     return best
 
 if __name__=="__main__":
