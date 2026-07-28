@@ -51,6 +51,13 @@ except Exception: HAS_SHAP=False
 # =============================== CONFIG =====================================
 FILE_LWT   = "mixture_dataset_lwt.csv"
 FILE_SCB   = "mixture_dataset_scb.csv"
+# Optional: read both targets from ONE Excel sheet instead of two CSVs.
+# If XL_PATH is set and the file exists, XL_SHEET is used for both targets.
+XL_PATH    = "mixture_dataset_clean_lwtscb.xlsx"
+XL_SHEET   = "in"
+# Per-target feature-group DROPS (evidence from feature_study.py ablation).
+# ADDITIVES hurt LWT (-0.003) and help SCB (+0.001) -> drop for LWT only.
+DROP_GROUPS = {"LWT": {"ADDITIVES"}, "SCB": set()}
 FOLDS      = 10
 RANDOM     = 42
 LOG_LWT    = False      # model log1p(LWT)? marginal; keep False for real-unit SHAP/PDP
@@ -127,6 +134,9 @@ def gradation(df):
         D=pd.concat(devs,axis=1); G["MDL_meanabs"]=D.abs().mean(axis=1); G["MDL_area"]=D.sum(axis=1)
     return G
 
+ADDITIVE_COLS=["AntiStrip_add","WMA_add","Latex_add","Fiber_add",
+               "add_antistrip","add_wma","add_fiber","add_polymer","add_count","add_dose_max","add_dose_sum",
+               "Polymer"]
 def add_additives(df):
     """Binder-additive chemistry features (only if the columns are present):
     anti-strip, WMA, fiber, polymer flags + additive count & dosage. These were
@@ -282,7 +292,11 @@ def grouped_three_way(X,y,grp,seed=RANDOM):
 # ============================ COMPUTE =======================================
 def compute(path,name,target,unit):
     print("\n"+"="*74+f"\n  {name}  — VIF screen + tuned models + grouped {FOLDS}-fold CV\n"+"="*74)
-    fpath=resolve(path); df=pd.read_csv(fpath)
+    # Data source: prefer XL_PATH+XL_SHEET if it exists (single Excel with both targets)
+    if XL_PATH and os.path.isfile(resolve(XL_PATH)):
+        fpath=resolve(XL_PATH); df=pd.read_excel(fpath,sheet_name=XL_SHEET)
+    else:
+        fpath=resolve(path); df=pd.read_csv(fpath)
     gcol=find_group_col(df)
     if gcol is None:
         raise KeyError(f"No mix-ID column found in:\n    {fpath}\n"
@@ -295,6 +309,15 @@ def compute(path,name,target,unit):
     y=num(df[target]).values; keep=np.isfinite(y)
     df=df[keep].reset_index(drop=True); y=y[keep]; grp=df[gcol].astype(str).values
     Xfull=build_features(df,target)
+    # per-target group drops (evidence-based; e.g. LWT drops ADDITIVES)
+    drop_names=set()
+    if "ADDITIVES" in DROP_GROUPS.get(name,set()):
+        drop_names |= {c for c in Xfull.columns if c in ADDITIVE_COLS
+                       or c.startswith("Binder_Modification_")}
+    if drop_names:
+        print(f"  DROP_GROUPS[{name}] -> dropped {len(drop_names)} features "
+              f"({sorted(drop_names)[:6]}{'...' if len(drop_names)>6 else ''})")
+        Xfull=Xfull.drop(columns=list(drop_names))
     kept,screen=screen_features(Xfull,y); X=Xfull[kept]
     log=(name=="LWT" and LOG_LWT); inv=(np.expm1 if log else (lambda p:p)); yfit=np.log1p(y) if log else y
     print(f"  rows={len(X)}  unique mixes={len(np.unique(grp))}  features(after screen)={X.shape[1]}  "
