@@ -127,18 +127,22 @@ def run(name):
     sgkf=StratifiedGroupKFold(FOLDS,shuffle=True,random_state=RANDOM)
     folds=list(sgkf.split(X,yb,groups=grp))
     inv=(np.expm1 if log else (lambda p:p)); yfit=np.log1p(y) if log else y
-    oof_all={}; foldr2={}
+    oof_all={}; foldr2={}; trainr2={}; tr_pred={}
+    print(f"    {'model':11s}  TRAIN R2   TEST R2(OOF)   test RMSE   test fold(mean±std)")
     for nm in zoo():
-        oof=np.zeros(len(y)); fr=[]
-        for a,b in folds:
-            mm=zoo()[nm]; mm.fit(X.iloc[a],yfit[a]); oof[b]=inv(mm.predict(X.iloc[b])); fr.append(r2_score(y[b],oof[b]))
-        r2,rmse,mae=met(y,oof); oof_all[nm]=oof; foldr2[nm]=np.array(fr)
-        print(f"    {nm:11s} OOF R2={r2:.3f}  RMSE={rmse:.3f}  MAE={mae:.3f}  | fold={np.mean(fr):.3f}±{np.std(fr):.3f}")
+        oof=np.zeros(len(y)); fr=[]; trs=[]; tr_pred[nm]={}
+        for fi,(a,b) in enumerate(folds):
+            mm=zoo()[nm]; mm.fit(X.iloc[a],yfit[a])
+            ptr=inv(mm.predict(X.iloc[a])); oof[b]=inv(mm.predict(X.iloc[b]))
+            trs.append(r2_score(y[a],ptr)); fr.append(r2_score(y[b],oof[b])); tr_pred[nm][fi]=ptr
+        r2,rmse,mae=met(y,oof); oof_all[nm]=oof; foldr2[nm]=np.array(fr); trainr2[nm]=np.mean(trs)
+        print(f"    {nm:11s}   {np.mean(trs):.3f}      {r2:.3f}          {rmse:.3f}      {np.mean(fr):.3f}±{np.std(fr):.3f}")
     W=opt_ens(oof_all,y); ens=sum(W[k]*oof_all[k] for k in W)
     r2,rmse,mae=met(y,ens)
     fr=[r2_score(y[b],ens[b]) for _,b in folds]
-    print(f"    {'ENSEMBLE':11s} OOF R2={r2:.3f}  RMSE={rmse:.3f}  MAE={mae:.3f}  | fold={np.mean(fr):.3f}±{np.std(fr):.3f}")
-    print(f"    weights: { {k:round(W[k],2) for k in W if W[k]>0} }")
+    ens_tr=np.mean([r2_score(y[a],sum(W[k]*tr_pred[k][fi] for k in W)) for fi,(a,_) in enumerate(folds)])
+    print(f"    {'ENSEMBLE':11s}   {ens_tr:.3f}      {r2:.3f}          {rmse:.3f}      {np.mean(fr):.3f}±{np.std(fr):.3f}")
+    print(f"    weights: { {k:round(W[k],2) for k in W if W[k]>0} }   train-test gap={ens_tr-r2:.3f}")
     # SHAP (fold-0 train -> its val)
     top=None
     if HAS_SHAP:
