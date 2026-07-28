@@ -90,6 +90,17 @@ def resolve(name):
         if hit: return hit[0]
     return name
 
+# The per-mix grouping key. Grouped CV needs it so a mix's replicate rows never
+# span folds. Auto-detected across common spellings; edit GROUP_CANDIDATES if yours differs.
+GROUP_CANDIDATES=["Mix_ID","MixID","Mix ID","Mix_Design_Key","MixDesignKey","MixDesignID",
+                  "JMF_ID","JMF_Key","Mix Design Key","MixID_v","Mix_ID_v"]
+def find_group_col(df):
+    norm={re.sub(r'[^a-z0-9]','',str(c).lower()):c for c in df.columns}
+    for cand in GROUP_CANDIDATES:
+        k=re.sub(r'[^a-z0-9]','',cand.lower())
+        if k in norm: return norm[k]
+    return None
+
 # =========================== FEATURES =======================================
 CAT=["Design_Level","Binder_Modification","Mix_Type","Spec_Edition"]
 IDS=["Project_ID","Mix_ID","IsVerification","Date_Approved"]
@@ -271,8 +282,18 @@ def grouped_three_way(X,y,grp,seed=RANDOM):
 # ============================ COMPUTE =======================================
 def compute(path,name,target,unit):
     print("\n"+"="*74+f"\n  {name}  — VIF screen + tuned models + grouped {FOLDS}-fold CV\n"+"="*74)
-    df=pd.read_csv(resolve(path)); y=num(df[target]).values; keep=np.isfinite(y)
-    df=df[keep].reset_index(drop=True); y=y[keep]; grp=df["Mix_ID"].astype(str).values
+    fpath=resolve(path); df=pd.read_csv(fpath)
+    gcol=find_group_col(df)
+    if gcol is None:
+        raise KeyError(f"No mix-ID column found in:\n    {fpath}\n"
+                       f"  Looked for {GROUP_CANDIDATES}.\n  Columns present: {list(df.columns)}\n"
+                       f"  Fix: point FILE_{name} at the right CSV, or rename your per-mix key to 'Mix_ID' "
+                       f"(or add its name to GROUP_CANDIDATES).")
+    if target not in df.columns:
+        raise KeyError(f"Target column '{target}' not in {fpath}. Columns: {list(df.columns)}")
+    print(f"  file: {fpath}  | group column: '{gcol}'")
+    y=num(df[target]).values; keep=np.isfinite(y)
+    df=df[keep].reset_index(drop=True); y=y[keep]; grp=df[gcol].astype(str).values
     Xfull=build_features(df,target)
     kept,screen=screen_features(Xfull,y); X=Xfull[kept]
     log=(name=="LWT" and LOG_LWT); inv=(np.expm1 if log else (lambda p:p)); yfit=np.log1p(y) if log else y
