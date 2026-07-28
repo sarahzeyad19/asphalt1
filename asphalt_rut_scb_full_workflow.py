@@ -55,6 +55,20 @@ FOLDS      = 10
 RANDOM     = 42
 LOG_LWT    = False      # model log1p(LWT)? marginal; keep False for real-unit SHAP/PDP
 VIF_THRESH = 10.0       # drop numeric features until every VIF <= this
+# Features VIF must NEVER drop, even if collinear — physically important to
+# rutting/cracking and shown to enhance the model in earlier trials. VIF still
+# prunes the OTHER redundant columns around them.
+EXEMPT_VIF = [
+    # binder / PG grade
+    "PG_High_Temp_C","PG_Low_Temp_C","PG_span","Polymer",
+    "PG_x_Voids","PG_x_RBR","PG_x_AFT","PG_x_Pbe",
+    # RAP family (RAP %, AC-from-RAP, RAP binder ratio, film thickness)
+    "RAP","Total_AC_from_RAP","RBR","AFT",
+    # core volumetrics / binder content that drive performance
+    "Voids","VFA","Pbe","AC","Gse","Dust_Pbeff",
+    # aggregate cleanliness + key gradation-shape terms
+    "Combined_SandEq","Pass_No_30","Grad_CA","Grad_CoarseSlope","Grad_FM",
+]
 SPEARMAN_MIN = 0.0      # drop features whose |Spearman rho| with target < this (0 = keep all, report only)
 TUNE       = True       # hyperparameter-tune every model (RandomizedSearchCV, grouped)
 TUNE_N_ITER= 30         # search iterations per model
@@ -142,19 +156,25 @@ def screen_features(X,y):
     # (1) Spearman |rho| with target
     sp=X.apply(lambda col: abs(spearmanr(col,y).correlation) if np.std(col)>0 else 0.0)
     sp=sp.fillna(0.0).sort_values(ascending=False)
-    weak=[c for c in X.columns if c not in dummies and sp.get(c,0)<SPEARMAN_MIN]
+    weak=[c for c in X.columns if c not in dummies and c not in EXEMPT_VIF and sp.get(c,0)<SPEARMAN_MIN]
     Xs=X.drop(columns=weak)
-    # (2) VIF prune numeric
+    # (2) VIF prune numeric — but NEVER drop exempt (physically-important) or dummy cols.
+    exempt=set(EXEMPT_VIF)
     cur=[c for c in Xs.columns if c not in dummies]; dropped=[]
-    while len(cur)>2:
-        vif=compute_vif(Xs[cur]); worst=vif.idxmax(); vmax=float(vif.max())
-        if vmax<=VIF_THRESH: break
-        cur.remove(worst); dropped.append((worst,round(vmax,1)))
+    while True:
+        vif=compute_vif(Xs[cur])
+        droppable=vif[[c for c in cur if c not in exempt]]
+        if len(droppable)==0 or float(droppable.max())<=VIF_THRESH: break
+        worst=droppable.idxmax(); cur.remove(worst); dropped.append((worst,round(float(droppable.max()),1)))
     kept=[c for c in X.columns if c in cur or c in dummies]
     vif_final=compute_vif(Xs[cur]) if len(cur)>=2 else pd.Series(dtype=float)
+    kept_exempt=[c for c in cur if c in exempt]
     print(f"  screening: Spearman dropped {len(weak)} (|rho|<{SPEARMAN_MIN}); "
-          f"VIF dropped {len(dropped)} (>{VIF_THRESH}); kept {len(kept)} features")
+          f"VIF dropped {len(dropped)} (>{VIF_THRESH}, non-exempt only); kept {len(kept)} features "
+          f"({len(kept_exempt)} protected/exempt)")
     if dropped: print("    VIF-dropped:", ", ".join(f"{c}({v})" for c,v in dropped[:12])+(" ..." if len(dropped)>12 else ""))
+    hi_exempt=[(c,round(float(vif_final[c]),1)) for c in kept_exempt if c in vif_final.index and vif_final[c]>VIF_THRESH]
+    if hi_exempt: print("    kept despite high VIF (protected):", ", ".join(f"{c}({v})" for c,v in hi_exempt))
     return kept, dict(spearman=sp, vif_final=vif_final, vif_dropped=dropped, spearman_dropped=weak)
 
 # ============================ MODELS ========================================
@@ -282,7 +302,7 @@ def fig_vif(R):
     ax.set_xticks(range(len(vif))); ax.set_xticklabels(vif.index,rotation=90,fontsize=7)
     ax.set_ylabel("VIF (retained features)")
     drop=R["screen"]["vif_dropped"]
-    ax.set_title(f"{name}: VIF after multicollinearity pruning (dropped {len(drop)} high-VIF features)")
+    ax.set_title(f"{name}: VIF after pruning (dropped {len(drop)} redundant; bars over line = protected/exempt features kept on purpose)")
     ax.legend(); fig.tight_layout(); _save(fig,name,"vif")
 
 def fig_spearman_target(R):
