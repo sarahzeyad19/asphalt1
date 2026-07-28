@@ -68,6 +68,8 @@ EXEMPT_VIF = [
     "Voids","VFA","Pbe","AC","Gse","Dust_Pbeff",
     # aggregate cleanliness + key gradation-shape terms
     "Combined_SandEq","Pass_No_30","Grad_CA","Grad_CoarseSlope","Grad_FM",
+    # binder-additive chemistry (biggest enhancer in earlier trials)
+    "add_antistrip","add_wma","add_fiber","add_polymer","add_count","add_dose_max","add_dose_sum",
 ]
 SPEARMAN_MIN = 0.0      # drop features whose |Spearman rho| with target < this (0 = keep all, report only)
 TUNE       = True       # hyperparameter-tune every model (RandomizedSearchCV, grouped)
@@ -114,6 +116,29 @@ def gradation(df):
         D=pd.concat(devs,axis=1); G["MDL_meanabs"]=D.abs().mean(axis=1); G["MDL_area"]=D.sum(axis=1)
     return G
 
+def add_additives(df):
+    """Binder-additive chemistry features (only if the columns are present):
+    anti-strip, WMA, fiber, polymer flags + additive count & dosage. These were
+    the single biggest enhancer in earlier trials (~+0.06 R2)."""
+    A=pd.DataFrame(index=df.index)
+    if "Binder_Additive_Name" not in df.columns: return A
+    up=df["Binder_Additive_Name"].astype(str).str.upper()
+    A["add_antistrip"]=up.str.contains("ANTI.?STRIP|AD.?HERE|PERMA.?TAC|LA.?2",regex=True).astype(float)
+    A["add_wma"]      =up.str.contains("WMA|EVOTHERM|ZYCO|THERMA|WARM",regex=True).astype(float)
+    A["add_fiber"]    =up.str.contains("FIBER|CELLULOSE",regex=True).astype(float)
+    A["add_polymer"]  =(up.str.contains("LATEX|SBS|POLYMER|RUBBER",regex=True)
+                        | df.get("Binder_Modification",pd.Series("",index=df.index)).astype(str).str.upper().str.contains("MODIF")
+                        | df.get("PG_Grade",pd.Series("",index=df.index)).astype(str).str.contains(r"\d2m|\d2M|rm|RM",regex=True)).astype(float)
+    A["add_count"]=df["Binder_Additive_Name"].apply(lambda s:max(0,str(s).count(",")))
+    if "Binder_Additive_PercentMix" in df.columns:
+        def doses(s):
+            vals=[pd.to_numeric(p.strip(),errors="coerce") for p in str(s).split(",")[1:]]
+            vals=[float(v) for v in vals if not pd.isna(v)]
+            return (max(vals) if vals else 0.0, sum(vals) if vals else 0.0)
+        d=df["Binder_Additive_PercentMix"].apply(doses)
+        A["add_dose_max"]=d.apply(lambda t:t[0]); A["add_dose_sum"]=d.apply(lambda t:t[1])
+    return A
+
 def build_features(df, target):
     X=pd.DataFrame(index=df.index); skip=set(IDS+CAT+[target]+list(SIEVE_MM))
     for c in df.columns:
@@ -132,6 +157,8 @@ def build_features(df, target):
         if "Pbe" in df: X["PG_x_Pbe"]=ph*num(df["Pbe"])
     if "Binder_Modification" in df:
         X["Polymer"]=df["Binder_Modification"].astype(str).str.upper().str.contains("MODIF").astype(float)
+    add=add_additives(df)                      # binder-additive chemistry (if columns present)
+    if add.shape[1]: X=pd.concat([X,add.set_index(X.index)],axis=1)
     for c in CAT:
         if c in df:
             X=pd.concat([X,pd.get_dummies(df[c].astype(str),prefix=c).astype(float).set_index(X.index)],axis=1)
