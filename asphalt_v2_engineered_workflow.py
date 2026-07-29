@@ -172,33 +172,39 @@ def make_pipe(estimator, num_cols, cat_cols):
 
 # ==================== STEPS 11-12: models + TUNING ==========================
 def model_grids():
-    """Strong-regularization GridSearchCV spaces (small but sensible)."""
+    """Strong-regularization GridSearchCV spaces — kept SMALL (each grid <=12
+    combos) so total runtime with 3 inner folds stays tractable on ~3.5k rows."""
     g={
-    "LightGBM":(lgb.LGBMRegressor(random_state=RANDOM,n_jobs=1,verbose=-1),{
-        "est__n_estimators":[500,800],"est__learning_rate":[0.02,0.04],
-        "est__num_leaves":[31,63],"est__min_child_samples":[15,30],
-        "est__subsample":[0.7,0.85],"est__colsample_bytree":[0.6,0.8],
-        "est__reg_alpha":[0.0,0.5],"est__reg_lambda":[1.0,2.0],"est__max_depth":[5,8]}),
-    "HistGB":(HistGradientBoostingRegressor(random_state=RANDOM),{
-        "est__max_iter":[500,800],"est__learning_rate":[0.02,0.04],
-        "est__max_leaf_nodes":[31,63],"est__min_samples_leaf":[15,30],
-        "est__l2_regularization":[0.1,1.0],"est__max_depth":[5,8]}),
-    "ExtraTrees":(ExtraTreesRegressor(random_state=RANDOM,n_jobs=1),{
-        "est__n_estimators":[400,700],"est__min_samples_leaf":[2,4],
-        "est__max_features":[0.5,0.7],"est__max_depth":[None,20]}),
-    "RandomForest":(RandomForestRegressor(random_state=RANDOM,n_jobs=1),{
-        "est__n_estimators":[400,700],"est__min_samples_leaf":[3,5],
-        "est__max_features":[0.5,0.7],"est__max_depth":[None,20]})}
+    # 8 combos
+    "LightGBM":(lgb.LGBMRegressor(random_state=RANDOM,n_jobs=1,verbose=-1,n_estimators=800),{
+        "est__learning_rate":[0.02,0.04],
+        "est__num_leaves":[31,63],
+        "est__min_child_samples":[15,30],
+        "est__reg_lambda":[1.0,2.0]}),
+    # 8 combos
+    "HistGB":(HistGradientBoostingRegressor(random_state=RANDOM,max_iter=800),{
+        "est__learning_rate":[0.02,0.04],
+        "est__max_leaf_nodes":[31,63],
+        "est__min_samples_leaf":[15,30],
+        "est__l2_regularization":[0.1,1.0]}),
+    # 6 combos
+    "ExtraTrees":(ExtraTreesRegressor(random_state=RANDOM,n_jobs=1,n_estimators=500),{
+        "est__min_samples_leaf":[1,2,4],
+        "est__max_features":[0.5,0.7]}),
+    }
     if HAS_XGB:
-        g["XGBoost"]=(xgb.XGBRegressor(random_state=RANDOM,n_jobs=1,verbosity=0),{
-            "est__n_estimators":[500,800],"est__learning_rate":[0.02,0.04],
-            "est__max_depth":[5,7],"est__subsample":[0.7,0.85],
-            "est__colsample_bytree":[0.6,0.8],"est__reg_alpha":[0.0,0.5],
-            "est__reg_lambda":[1.0,2.0],"est__min_child_weight":[3,6]})
+        # 8 combos
+        g["XGBoost"]=(xgb.XGBRegressor(random_state=RANDOM,n_jobs=1,verbosity=0,n_estimators=800),{
+            "est__learning_rate":[0.02,0.04],
+            "est__max_depth":[5,7],
+            "est__subsample":[0.7,0.85],
+            "est__reg_lambda":[1.0,2.0]})
     if HAS_CAT:
-        g["CatBoost"]=(CatBoostRegressor(random_state=RANDOM,verbose=0),{
-            "est__iterations":[500,800],"est__learning_rate":[0.02,0.04],
-            "est__depth":[5,7],"est__l2_leaf_reg":[2.0,5.0]})
+        # 8 combos
+        g["CatBoost"]=(CatBoostRegressor(random_state=RANDOM,verbose=0,iterations=800),{
+            "est__learning_rate":[0.02,0.04],
+            "est__depth":[5,7],
+            "est__l2_leaf_reg":[2.0,5.0]})
     return g
 
 def opt_ens(oof,y):
