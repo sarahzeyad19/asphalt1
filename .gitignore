@@ -10,4 +10,7 @@ __pycache__/
 
 # User data (do not commit raw datasets)
 *.csv
+*.xlsx
 mixture_dataset.csv
+mixture_dataset_*.csv
+mixture_dataset_*.xlsx
